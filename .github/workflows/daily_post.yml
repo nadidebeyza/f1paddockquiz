@@ -1,0 +1,79 @@
+name: F1 Paddock Quiz — Daily Post & Answer Comment
+
+on:
+  schedule:
+    # Daily feed post — UTC 17:00 (Turkey 20:00)
+    - cron: '0 17 * * *'
+    # Answer comments — every hour (posts when 3h delay has elapsed)
+    - cron: '0 * * * *'
+
+  workflow_dispatch:
+
+concurrency:
+  group: f1paddockquiz-${{ github.ref_name }}
+  cancel-in-progress: false
+
+jobs:
+  run-post:
+    if: github.event.schedule == '0 17 * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore question database cache
+        uses: actions/cache@v4
+        with:
+          path: database.db
+          key: quiz-db-${{ github.ref_name }}
+          save-always: true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run Quiz Post Automation
+        env:
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          COMMENT_DELAY_HOURS: 3
+        run: python main.py
+
+  run-comments:
+    if: github.event.schedule == '0 * * * *' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Restore question database cache
+        uses: actions/cache@v4
+        with:
+          path: database.db
+          key: quiz-db-${{ github.ref_name }}
+          save-always: true
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Post Scheduled Answer Comments
+        env:
+          INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+        run: python main.py --post-comments

@@ -1,0 +1,1227 @@
+#!/usr/bin/env python3
+"""
+F1 Paddock Quiz — Instagram Automation Pipeline
+
+Generates hardcore F1 trivia via Gemini, renders a branded 1080x1350 quiz image,
+hosts it publicly, publishes to Instagram, and schedules an answer comment 3 hours later.
+Duplicate questions are blocked via SQLite (30-day rolling window).
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import logging
+import math
+import os
+import re
+import sqlite3
+import sys
+import time
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+import requests
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
+from PIL import Image, ImageDraw, ImageFilter, ImageFont
+
+# ---------------------------------------------------------------------------
+# Configuration
+# ---------------------------------------------------------------------------
+
+load_dotenv()
+
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-2.5-flash")
+GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "4"))
+GEMINI_RETRY_BASE_SECONDS = int(os.getenv("GEMINI_RETRY_BASE_SECONDS", "5"))
+MODELS_TO_TRY = [
+    "gemini-2.5-flash",
+    "gemini-2.0-flash",
+]
+GEMINI_FALLBACK_MODELS = [
+    model.strip()
+    for model in os.getenv("GEMINI_FALLBACK_MODELS", "gemini-2.0-flash").split(",")
+    if model.strip()
+]
+INSTAGRAM_ACCOUNT_ID = (os.getenv("INSTAGRAM_ACCOUNT_ID") or "").strip()
+INSTAGRAM_ACCESS_TOKEN = (os.getenv("INSTAGRAM_ACCESS_TOKEN") or "").strip().strip('"').strip("'")
+FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "")
+
+GRAPH_API_VERSION = "v26.0"
+GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+INSTAGRAM_LOGIN_API_VERSION = os.getenv("INSTAGRAM_LOGIN_API_VERSION", "v23.0")
+INSTAGRAM_LOGIN_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_LOGIN_API_VERSION}"
+
+CANVAS_WIDTH = 1080
+CANVAS_HEIGHT = 1350
+CARD_INSET = 80
+COLOR_BLACK = (17, 17, 17)
+COLOR_WHITE = (255, 255, 255)
+COLOR_GRAY_TEXT = (17, 17, 17)
+COLOR_OPTION_BG = (240, 240, 240)
+COLOR_LETTER_BG = (17, 17, 17)
+COLOR_LETTER_TEXT = (255, 255, 255)
+COLOR_SHADOW = (0, 0, 0, 60)
+
+BASE_DIR = Path(__file__).resolve().parent
+OUTPUT_IMAGE = BASE_DIR / "final_post.jpg"
+DATABASE_PATH = BASE_DIR / "database.db"
+FONT_PATH = BASE_DIR / "font.ttf"
+
+POLL_INTERVAL_SECONDS = 5
+POLL_MAX_WAIT_SECONDS = 30
+DUPLICATE_WINDOW_DAYS = int(os.getenv("DUPLICATE_WINDOW_DAYS", "30"))
+DUPLICATE_CONTENT_RETRIES = int(os.getenv("DUPLICATE_CONTENT_RETRIES", "5"))
+COMMENT_DELAY_HOURS = int(os.getenv("COMMENT_DELAY_HOURS", "3"))
+WAIT_FOR_COMMENT = os.getenv("WAIT_FOR_COMMENT", "").lower() in ("1", "true", "yes")
+
+CONTENT_JSON_SCHEMA: dict[str, Any] = {
+    "type": "object",
+    "properties": {
+        "question": {
+            "type": "string",
+            "description": "Hardcore F1 trivia question — on-track sport only.",
+        },
+        "options": {
+            "type": "object",
+            "properties": {
+                "A": {"type": "string"},
+                "B": {"type": "string"},
+                "C": {"type": "string"},
+                "D": {"type": "string"},
+            },
+            "required": ["A", "B", "C", "D"],
+        },
+        "correct_option": {
+            "type": "string",
+            "enum": ["A", "B", "C", "D"],
+        },
+        "explanation": {
+            "type": "string",
+            "description": "Detailed factual explanation of the correct answer.",
+        },
+        "caption": {
+            "type": "string",
+            "description": "Instagram caption with hook, CTA, and hashtags.",
+        },
+    },
+    "required": ["question", "options", "correct_option", "explanation", "caption"],
+}
+
+GEMINI_SYSTEM_PROMPT = """You are the content engine for @f1paddockquiz — an Instagram account that posts
+REALLY HARD / HARDCORE Formula 1 trivia for true racing fans and F1 gurus.
+
+Generate ONE unique quiz question that is:
+- Genuinely difficult — not surface-level fan trivia
+- Factually accurate and verifiable from official F1 history and statistics
+- Engaging and save-worthy for motorsport enthusiasts
+
+ALLOWED TOPICS (on-track sport only):
+- F1 history, race statistics, Grand Prix wins and records
+- Circuit layouts, lap records, track-specific facts
+- Pit stop rules, sporting regulations, technical regulations
+- Engine eras (V10, V8, hybrid), aero rules, tyre compounds
+- Championship standings, points ties, qualifying records, team statistics
+
+STRICT PROHIBITION — NEVER ask about:
+- Drivers' personal lives, relationships, girlfriends, fashion, childhood
+- Off-track celebrity drama, social media, or lifestyle content
+- Rumors, gossip, or speculative off-track narratives
+
+Rules:
+- question MUST be a single clear trivia question (max ~35 words)
+- options MUST have exactly 4 choices labeled A, B, C, D — all plausible but one correct
+- correct_option MUST be exactly one of: A, B, C, or D
+- explanation MUST be 2-4 sentences with specific facts (years, races, numbers)
+- caption MUST include a hook, invite comments (A/B/C/D), note answer in 3 hours, and hashtags
+- caption MUST be plain text — no markdown (**bold**, etc.)
+- NEVER repeat any question listed in the "Recently published — DO NOT REUSE" section
+- Output ONLY valid JSON matching the schema — no markdown, no commentary
+"""
+
+GEMINI_SYSTEM_PROMPT_BASE = GEMINI_SYSTEM_PROMPT
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s | %(levelname)s | %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger("f1paddockquiz")
+
+
+def _strip_markdown(text: str) -> str:
+    cleaned = text
+    cleaned = re.sub(r"\*\*(.+?)\*\*", r"\1", cleaned)
+    cleaned = re.sub(r"__(.+?)__", r"\1", cleaned)
+    cleaned = re.sub(r"(?<!\*)\*(?!\*)(.+?)(?<!\*)\*(?!\*)", r"\1", cleaned)
+    cleaned = cleaned.replace("**", "").replace("__", "").replace("`", "")
+    return re.sub(r"  +", " ", cleaned).strip()
+
+
+def _normalize_question(text: str) -> str:
+    lowered = text.lower().strip()
+    lowered = re.sub(r"[^\w\s]", "", lowered)
+    return re.sub(r"\s+", " ", lowered)
+
+
+def _question_hash(text: str) -> str:
+    normalized = _normalize_question(text)
+    return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
+
+
+@dataclass
+class QuizContent:
+    question: str
+    options: dict[str, str]
+    correct_option: str
+    explanation: str
+    caption: str
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> QuizContent:
+        options = {key: _strip_markdown(str(data["options"][key]).strip()) for key in ("A", "B", "C", "D")}
+        correct = data["correct_option"].strip().upper()
+        if correct not in options:
+            raise ValueError(f"correct_option must be A, B, C, or D — got '{correct}'")
+
+        question = _strip_markdown(data["question"].strip())
+        if len(question.split()) < 5:
+            raise ValueError(f"Question too short: {question}")
+
+        return cls(
+            question=question,
+            options=options,
+            correct_option=correct,
+            explanation=_strip_markdown(data["explanation"].strip()),
+            caption=_strip_markdown(data["caption"].strip()),
+        )
+
+    def full_caption(self) -> str:
+        return self.caption
+
+    def answer_comment(self) -> str:
+        correct_text = self.options[self.correct_option]
+        return (
+            f"✅ Correct Answer: {self.correct_option} — {correct_text}\n\n"
+            f"📖 Explanation:\n{self.explanation}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# SQLite — duplicate prevention & comment scheduling
+# ---------------------------------------------------------------------------
+
+
+def _get_db() -> sqlite3.Connection:
+    conn = sqlite3.connect(DATABASE_PATH)
+    conn.row_factory = sqlite3.Row
+    return conn
+
+
+def init_db() -> None:
+    with _get_db() as conn:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS questions (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                question_hash TEXT NOT NULL,
+                question_text TEXT NOT NULL,
+                options_json TEXT NOT NULL,
+                correct_option TEXT NOT NULL,
+                explanation TEXT NOT NULL,
+                caption TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                published_at TEXT,
+                media_id TEXT,
+                comment_scheduled_at TEXT,
+                comment_posted_at TEXT,
+                comment_text TEXT
+            )
+            """
+        )
+        conn.execute(
+            "CREATE INDEX IF NOT EXISTS idx_question_hash_created "
+            "ON questions (question_hash, created_at)"
+        )
+        conn.commit()
+
+
+def is_duplicate_question(question_text: str) -> bool:
+    """Return True if this question (or hash) exists within the rolling window."""
+    init_db()
+    question_hash = _question_hash(question_text)
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DUPLICATE_WINDOW_DAYS)
+    cutoff_str = cutoff.isoformat()
+
+    with _get_db() as conn:
+        row = conn.execute(
+            """
+            SELECT id FROM questions
+            WHERE question_hash = ? AND created_at >= ?
+            LIMIT 1
+            """,
+            (question_hash, cutoff_str),
+        ).fetchone()
+        if row:
+            return True
+
+        normalized = _normalize_question(question_text)
+        rows = conn.execute(
+            "SELECT question_text FROM questions WHERE created_at >= ?",
+            (cutoff_str,),
+        ).fetchall()
+        for existing in rows:
+            if _normalize_question(existing["question_text"]) == normalized:
+                return True
+    return False
+
+
+def record_question(
+    content: QuizContent,
+    *,
+    published_at: str | None = None,
+    media_id: str | None = None,
+    comment_scheduled_at: str | None = None,
+    comment_text: str | None = None,
+) -> int:
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_db() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO questions (
+                question_hash, question_text, options_json, correct_option,
+                explanation, caption, created_at, published_at, media_id,
+                comment_scheduled_at, comment_text
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                _question_hash(content.question),
+                content.question,
+                json.dumps(content.options, ensure_ascii=False),
+                content.correct_option,
+                content.explanation,
+                content.caption,
+                now,
+                published_at,
+                media_id,
+                comment_scheduled_at,
+                comment_text,
+            ),
+        )
+        conn.commit()
+        return int(cursor.lastrowid)
+
+
+def mark_published(record_id: int, media_id: str, comment_scheduled_at: str, comment_text: str) -> None:
+    with _get_db() as conn:
+        conn.execute(
+            """
+            UPDATE questions
+            SET published_at = ?, media_id = ?, comment_scheduled_at = ?, comment_text = ?
+            WHERE id = ?
+            """,
+            (
+                datetime.now(timezone.utc).isoformat(),
+                media_id,
+                comment_scheduled_at,
+                comment_text,
+                record_id,
+            ),
+        )
+        conn.commit()
+
+
+def get_pending_comments() -> list[sqlite3.Row]:
+    init_db()
+    now = datetime.now(timezone.utc).isoformat()
+    with _get_db() as conn:
+        return conn.execute(
+            """
+            SELECT * FROM questions
+            WHERE media_id IS NOT NULL
+              AND comment_scheduled_at IS NOT NULL
+              AND comment_posted_at IS NULL
+              AND comment_scheduled_at <= ?
+            ORDER BY comment_scheduled_at ASC
+            """,
+            (now,),
+        ).fetchall()
+
+
+def mark_comment_posted(record_id: int) -> None:
+    with _get_db() as conn:
+        conn.execute(
+            "UPDATE questions SET comment_posted_at = ? WHERE id = ?",
+            (datetime.now(timezone.utc).isoformat(), record_id),
+        )
+        conn.commit()
+
+
+def load_recent_questions(limit: int = 30) -> list[str]:
+    init_db()
+    cutoff = datetime.now(timezone.utc) - timedelta(days=DUPLICATE_WINDOW_DAYS)
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT question_text FROM questions WHERE created_at >= ? ORDER BY created_at DESC LIMIT ?",
+            (cutoff.isoformat(), limit),
+        ).fetchall()
+    return [row["question_text"] for row in rows]
+
+
+def show_question_history() -> None:
+    init_db()
+    with _get_db() as conn:
+        rows = conn.execute(
+            "SELECT question_text, published_at, comment_posted_at FROM questions ORDER BY created_at DESC LIMIT 30"
+        ).fetchall()
+    if not rows:
+        print(f"No entries in {DATABASE_PATH.name} yet.")
+        return
+    print(f"Last {len(rows)} questions in database:")
+    for index, row in enumerate(rows, start=1):
+        status = "commented" if row["comment_posted_at"] else "pending/no comment"
+        print(f"  {index:2}. {row['question_text'][:70]}... — {row['published_at'] or 'not published'} ({status})")
+
+
+# ---------------------------------------------------------------------------
+# Stage 1 — Content Engine (Gemini)
+# ---------------------------------------------------------------------------
+
+
+def _uses_instagram_login_api() -> bool:
+    """Instagram Login tokens start with IG…; Facebook/Page tokens start with EAA…"""
+    token = INSTAGRAM_ACCESS_TOKEN or ""
+    if token.startswith("EAA"):
+        return False
+    return token.startswith("IG")
+
+
+def _instagram_api_base() -> str:
+    return INSTAGRAM_LOGIN_API_BASE if _uses_instagram_login_api() else GRAPH_API_BASE
+
+
+def _resolve_instagram_account_id() -> str:
+    if not _uses_instagram_login_api():
+        if not INSTAGRAM_ACCOUNT_ID:
+            raise EnvironmentError("INSTAGRAM_ACCOUNT_ID is required for Facebook Login tokens")
+        return INSTAGRAM_ACCOUNT_ID
+
+    logger.info("Resolving Instagram account via Instagram Login API (/me)...")
+    data = _graph_request("GET", "me", params={"fields": "id,user_id,username"})
+    account_id = data.get("user_id") or data.get("id")
+    if not account_id:
+        raise RuntimeError("Could not resolve Instagram account id from /me")
+    logger.info(
+        "Instagram account resolved — @%s (publish id: %s)",
+        data.get("username", "unknown"),
+        account_id,
+    )
+    return str(account_id)
+
+
+PLACEHOLDER_MARKERS = ("your_", "changeme", "replace_me", "xxx", "example")
+
+
+def _looks_like_placeholder(value: str | None) -> bool:
+    if not value:
+        return True
+    lowered = value.strip().lower()
+    return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
+
+
+def validate_env() -> None:
+    required = {
+        "GEMINI_API_KEY": GEMINI_API_KEY,
+        "INSTAGRAM_ACCESS_TOKEN": INSTAGRAM_ACCESS_TOKEN,
+    }
+    if not _uses_instagram_login_api():
+        required["INSTAGRAM_ACCOUNT_ID"] = INSTAGRAM_ACCOUNT_ID
+
+    missing = [name for name, value in required.items() if not value]
+    if missing:
+        raise EnvironmentError(f"Missing required environment variables: {', '.join(missing)}")
+
+    placeholders = [name for name, value in required.items() if _looks_like_placeholder(value)]
+    if placeholders:
+        raise EnvironmentError(
+            f"{', '.join(placeholders)} still contain placeholder values in .env."
+        )
+
+    if not GEMINI_API_KEY.startswith(("AIza", "AQ.")):
+        raise EnvironmentError(
+            "GEMINI_API_KEY must start with 'AIza' or 'AQ.' from "
+            "https://aistudio.google.com/apikey"
+        )
+
+    if not _uses_instagram_login_api():
+        if not INSTAGRAM_ACCOUNT_ID.isdigit():
+            raise EnvironmentError(
+                f"INSTAGRAM_ACCOUNT_ID must be numeric, not '{INSTAGRAM_ACCOUNT_ID}'. "
+                "Run: python main.py --lookup-ig-id"
+            )
+
+
+def _gemini_models_to_try() -> list[str]:
+    if os.getenv("GEMINI_FALLBACK_MODELS"):
+        models = [GEMINI_MODEL]
+        for model in GEMINI_FALLBACK_MODELS:
+            if model not in models:
+                models.append(model)
+        return models
+
+    models: list[str] = []
+    for model in [GEMINI_MODEL, *MODELS_TO_TRY]:
+        if model not in models:
+            models.append(model)
+    return models
+
+
+def _is_invalid_gemini_api_key_error(exc: Exception) -> bool:
+    message = str(exc)
+    return "API key not valid" in message or "API_KEY_INVALID" in message
+
+
+def build_gemini_prompt(recent_questions: list[str], *, duplicate_retry: bool = False) -> str:
+    prompt = GEMINI_SYSTEM_PROMPT_BASE
+    if recent_questions:
+        prompt += (
+            f"\n\nRecently published — DO NOT REUSE any of these last "
+            f"{len(recent_questions)} questions:\n"
+        )
+        for question in recent_questions:
+            prompt += f"- {question}\n"
+        prompt += "Generate a completely different question not on this list."
+    if duplicate_retry:
+        prompt += (
+            "\nYour previous answer duplicated a banned question. "
+            "Generate something entirely new with different facts and topic."
+        )
+    return prompt
+
+
+def _call_gemini_for_content(client: genai.Client, prompt: str) -> QuizContent:
+    config = types.GenerateContentConfig(
+        temperature=0.9,
+        response_mime_type="application/json",
+        response_json_schema=CONTENT_JSON_SCHEMA,
+    )
+    last_error: Exception | None = None
+
+    for model in _gemini_models_to_try():
+        try:
+            logger.info("Attempting content generation with model: %s", model)
+            response = client.models.generate_content(
+                model=model,
+                contents=prompt,
+                config=config,
+            )
+            raw = response.text
+            if not raw:
+                raise ValueError("Gemini returned an empty response")
+            data = json.loads(raw)
+            return QuizContent.from_dict(data)
+        except json.JSONDecodeError as exc:
+            logger.warning("Model %s returned invalid JSON (%s). Trying next...", model, exc)
+            last_error = exc
+        except ValueError as exc:
+            logger.warning("Model %s validation failed (%s). Trying next...", model, exc)
+            last_error = exc
+        except genai.errors.ClientError as exc:
+            if _is_invalid_gemini_api_key_error(exc):
+                raise RuntimeError("Invalid GEMINI_API_KEY.") from exc
+            logger.warning("Model %s failed (%s). Trying next...", model, exc)
+            last_error = exc
+        except Exception as exc:
+            logger.warning("Model %s failed (%s). Trying next...", model, exc)
+            last_error = exc
+
+    raise RuntimeError("All Gemini models failed.") from last_error
+
+
+def generate_content() -> QuizContent:
+    client = genai.Client(api_key=GEMINI_API_KEY)
+    recent = load_recent_questions()
+    if recent:
+        logger.info("Avoiding %s recent questions from database", len(recent))
+
+    for duplicate_attempt in range(1, DUPLICATE_CONTENT_RETRIES + 1):
+        prompt = build_gemini_prompt(recent, duplicate_retry=duplicate_attempt > 1)
+        content = _call_gemini_for_content(client, prompt)
+
+        if is_duplicate_question(content.question):
+            logger.warning(
+                "Duplicate question blocked — regenerating (%s/%s)",
+                duplicate_attempt,
+                DUPLICATE_CONTENT_RETRIES,
+            )
+            continue
+
+        logger.info("[✓] Gemini Content Generated — %s", content.question[:80])
+        return content
+
+    raise RuntimeError(
+        f"Could not generate a unique question after {DUPLICATE_CONTENT_RETRIES} attempts."
+    )
+
+
+# ---------------------------------------------------------------------------
+# Stage 2 — Visual Engine (F1 Quiz Card / Pillow)
+# ---------------------------------------------------------------------------
+
+
+def _sans_font_candidates(bold: bool = False) -> list[Path]:
+    candidates: list[Path] = []
+    if FONT_PATH.exists():
+        candidates.append(FONT_PATH)
+
+    if sys.platform == "darwin":
+        if bold:
+            candidates.extend([
+                Path("/System/Library/Fonts/Supplemental/Arial Bold.ttf"),
+                Path("/System/Library/Fonts/Helvetica.ttc"),
+                Path("/Library/Fonts/Arial Bold.ttf"),
+            ])
+        else:
+            candidates.extend([
+                Path("/System/Library/Fonts/Supplemental/Arial.ttf"),
+                Path("/System/Library/Fonts/Helvetica.ttc"),
+                Path("/Library/Fonts/Arial.ttf"),
+            ])
+    elif sys.platform.startswith("linux"):
+        candidates.append(
+            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
+        )
+    else:
+        candidates.append(
+            Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf")
+        )
+    return candidates
+
+
+def _load_font(
+    size: int,
+    *,
+    bold: bool = False,
+) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in _sans_font_candidates(bold=bold):
+        if path.exists():
+            try:
+                return ImageFont.truetype(str(path), size=size)
+            except OSError:
+                continue
+    logger.warning("No sans-serif font found — using Pillow default")
+    return ImageFont.load_default()
+
+
+def _line_height(font: ImageFont.FreeTypeFont | ImageFont.ImageFont) -> int:
+    dummy = Image.new("RGB", (1, 1))
+    bbox = ImageDraw.Draw(dummy).textbbox((0, 0), "Ay", font=font)
+    return bbox[3] - bbox[1]
+
+
+def _text_width(
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> int:
+    dummy = Image.new("RGB", (1, 1))
+    bbox = ImageDraw.Draw(dummy).textbbox((0, 0), text, font=font)
+    return bbox[2] - bbox[0]
+
+
+def _wrap_text(
+    text: str,
+    font: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+) -> list[str]:
+    words = text.split()
+    if not words:
+        return [""]
+
+    lines: list[str] = []
+    current = words[0]
+    dummy = Image.new("RGB", (1, 1))
+    draw = ImageDraw.Draw(dummy)
+
+    for word in words[1:]:
+        trial = f"{current} {word}"
+        if draw.textbbox((0, 0), trial, font=font)[2] <= max_width:
+            current = trial
+        else:
+            lines.append(current)
+            current = word
+    lines.append(current)
+    return lines
+
+
+def _draw_wavy_checkerboard(width: int, height: int) -> Image.Image:
+    """Retro racing-flag aesthetic — monochrome wavy checkerboard."""
+    canvas = Image.new("RGB", (width, height), COLOR_BLACK)
+    draw = ImageDraw.Draw(canvas)
+    cell = 56
+
+    for row in range(-3, height // cell + 4):
+        wave_x = int(28 * math.sin(row * 0.55))
+        wave_y = int(12 * math.cos(row * 0.35))
+        for col in range(-3, width // cell + 4):
+            x = col * cell + wave_x
+            y = row * cell + wave_y + int(8 * math.sin(col * 0.4))
+            fill = COLOR_WHITE if (row + col) % 2 == 0 else (22, 22, 22)
+            draw.rectangle([x, y, x + cell + 4, y + cell + 4], fill=fill)
+
+    # Subtle vignette for depth
+    vignette = Image.new("L", (width, height), 0)
+    vdraw = ImageDraw.Draw(vignette)
+    vdraw.ellipse([-width * 0.1, -height * 0.05, width * 1.1, height * 1.05], fill=180)
+    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=120))
+    dark_layer = Image.new("RGB", (width, height), (0, 0, 0))
+    canvas = Image.composite(dark_layer, canvas, Image.eval(vignette, lambda p: 255 - p))
+    return canvas
+
+
+def _rounded_rect(
+    draw: ImageDraw.ImageDraw,
+    xy: tuple[int, int, int, int],
+    radius: int,
+    fill: tuple[int, ...],
+    outline: tuple[int, ...] | None = None,
+    width: int = 0,
+) -> None:
+    draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
+
+
+def _draw_dashed_curve(
+    draw: ImageDraw.ImageDraw,
+    start: tuple[int, int],
+    end: tuple[int, int],
+    *,
+    color: tuple[int, int, int] = (120, 120, 120),
+    dash: int = 10,
+    gap: int = 8,
+    width: int = 3,
+) -> None:
+    """Draw a dashed quadratic curve from start toward end."""
+    cx = (start[0] + end[0]) // 2
+    cy = start[1] - 40
+    steps = 48
+    points: list[tuple[int, int]] = []
+    for i in range(steps + 1):
+        t = i / steps
+        x = int((1 - t) ** 2 * start[0] + 2 * (1 - t) * t * cx + t ** 2 * end[0])
+        y = int((1 - t) ** 2 * start[1] + 2 * (1 - t) * t * cy + t ** 2 * end[1])
+        points.append((x, y))
+
+    segment = 0
+    for i in range(len(points) - 1):
+        if segment < dash:
+            draw.line([points[i], points[i + 1]], fill=color, width=width)
+        segment += 1
+        if segment >= dash + gap:
+            segment = 0
+
+
+def _draw_option_row(
+    draw: ImageDraw.ImageDraw,
+    x: int,
+    y: int,
+    letter: str,
+    text: str,
+    font_letter: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    font_option: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+    row_height: int = 72,
+) -> int:
+    letter_w = 52
+    letter_h = row_height
+    gap = 14
+    text_x = x + letter_w + gap
+    text_max_w = max_width - letter_w - gap
+
+    _rounded_rect(draw, (x, y, x + letter_w, y + letter_h), radius=letter_h // 2, fill=COLOR_LETTER_BG)
+    letter_bbox = draw.textbbox((0, 0), letter, font=font_letter)
+    letter_tx = x + (letter_w - (letter_bbox[2] - letter_bbox[0])) // 2
+    letter_ty = y + (letter_h - (letter_bbox[3] - letter_bbox[1])) // 2 - letter_bbox[1]
+    draw.text((letter_tx, letter_ty), letter, font=font_letter, fill=COLOR_LETTER_TEXT)
+
+    lines = _wrap_text(text, font_option, text_max_w - 32)
+    line_h = _line_height(font_option)
+    pill_h = max(row_height, len(lines) * line_h + 28)
+    pill_w = text_max_w
+
+    _rounded_rect(
+        draw,
+        (text_x, y, text_x + pill_w, y + pill_h),
+        radius=pill_h // 2,
+        fill=COLOR_OPTION_BG,
+        outline=(220, 220, 220),
+        width=1,
+    )
+
+    ty = y + (pill_h - len(lines) * line_h) // 2
+    for line in lines:
+        draw.text((text_x + 24, ty), line, font=font_option, fill=COLOR_GRAY_TEXT)
+        ty += line_h
+
+    return y + pill_h + 20
+
+
+def create_post_image(content: QuizContent) -> Path:
+    """Compose branded F1 quiz image on wavy checkerboard background."""
+    logger.info("Creating F1 quiz post image...")
+    try:
+        canvas = _draw_wavy_checkerboard(CANVAS_WIDTH, CANVAS_HEIGHT)
+
+        card_left = CARD_INSET
+        card_top = CARD_INSET + 40
+        card_right = CANVAS_WIDTH - CARD_INSET
+        card_bottom = CANVAS_HEIGHT - CARD_INSET
+        card_radius = 36
+
+        # Drop shadow
+        shadow = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
+        shadow_draw = ImageDraw.Draw(shadow)
+        _rounded_rect(
+            shadow_draw,
+            (card_left + 8, card_top + 12, card_right + 8, card_bottom + 12),
+            radius=card_radius,
+            fill=COLOR_SHADOW,
+        )
+        shadow = shadow.filter(ImageFilter.GaussianBlur(radius=18))
+        canvas = canvas.convert("RGBA")
+        canvas = Image.alpha_composite(canvas, shadow)
+        canvas = canvas.convert("RGB")
+        draw = ImageDraw.Draw(canvas)
+
+        # White card
+        _rounded_rect(
+            draw,
+            (card_left, card_top, card_right, card_bottom),
+            radius=card_radius,
+            fill=COLOR_WHITE,
+        )
+
+        font_badge_title = _load_font(52, bold=True)
+        font_badge_quiz = _load_font(28, bold=True)
+        font_question = _load_font(38, bold=True)
+        font_option = _load_font(26)
+        font_letter = _load_font(24, bold=True)
+
+        # Header badge overlapping card top
+        badge_y = card_top - 28
+        title_text = "F1 PADDOCK"
+        quiz_text = "QUIZ"
+        title_w = _text_width(title_text, font_badge_title) + 48
+        quiz_w = _text_width(quiz_text, font_badge_quiz) + 40
+        badge_x = (CANVAS_WIDTH - title_w - quiz_w - 16) // 2
+
+        _rounded_rect(
+            draw,
+            (badge_x, badge_y, badge_x + title_w, badge_y + 64),
+            radius=32,
+            fill=COLOR_WHITE,
+            outline=COLOR_BLACK,
+            width=3,
+        )
+        draw.text((badge_x + 24, badge_y + 10), title_text, font=font_badge_title, fill=COLOR_BLACK)
+
+        quiz_x = badge_x + title_w + 8
+        _rounded_rect(
+            draw,
+            (quiz_x, badge_y + 8, quiz_x + quiz_w, badge_y + 56),
+            radius=24,
+            fill=COLOR_BLACK,
+        )
+        draw.text((quiz_x + 20, badge_y + 16), quiz_text, font=font_badge_quiz, fill=COLOR_WHITE)
+
+        # Dashed arrow from badge toward question
+        arrow_start = (badge_x + title_w // 2, badge_y + 64)
+        arrow_end = (card_left + 80, card_top + 100)
+        _draw_dashed_curve(draw, arrow_start, arrow_end)
+
+        inner_left = card_left + 48
+        inner_right = card_right - 48
+        inner_width = inner_right - inner_left
+        y = card_top + 88
+
+        # Question text
+        question_lines = _wrap_text(content.question, font_question, inner_width)
+        q_line_h = _line_height(font_question)
+        for line in question_lines:
+            draw.text((inner_left, y), line, font=font_question, fill=COLOR_GRAY_TEXT)
+            y += q_line_h + 8
+        y += 36
+
+        # Options A–D
+        for letter in ("A", "B", "C", "D"):
+            y = _draw_option_row(
+                draw,
+                inner_left,
+                y,
+                letter,
+                content.options[letter],
+                font_letter,
+                font_option,
+                inner_width,
+            )
+
+        canvas.save(OUTPUT_IMAGE, format="JPEG", quality=95, optimize=True)
+        logger.info("[✓] Image Created — saved to %s", OUTPUT_IMAGE)
+        return OUTPUT_IMAGE
+    except Exception as exc:
+        logger.exception("Image creation failed")
+        raise RuntimeError("Image creation failed") from exc
+
+
+# ---------------------------------------------------------------------------
+# Stage 3 — Hosting
+# ---------------------------------------------------------------------------
+
+BROWSER_USER_AGENT = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
+
+
+def _verify_public_image_url(url: str) -> bool:
+    headers = {"User-Agent": BROWSER_USER_AGENT}
+    try:
+        response = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
+        if response.status_code >= 400:
+            response = requests.get(
+                url,
+                headers={**headers, "Range": "bytes=0-511"},
+                timeout=30,
+                allow_redirects=True,
+            )
+        content_type = response.headers.get("Content-Type", "").lower()
+        if content_type.startswith("image/"):
+            return True
+        if "text/html" in content_type:
+            return False
+    except requests.RequestException as exc:
+        if url.startswith(("https://files.catbox.moe/", "https://litter.catbox.moe/")):
+            logger.warning("Could not probe %s (%s) — trusting CDN URL", url, exc)
+            return True
+        return False
+    return False
+
+
+def upload_to_litterbox(image_path: Path) -> str:
+    logger.info("Uploading image to Litterbox...")
+    headers = {"User-Agent": BROWSER_USER_AGENT}
+    with image_path.open("rb") as handle:
+        response = requests.post(
+            "https://litterbox.catbox.moe/resources/internals/api.php",
+            data={"reqtype": "fileupload", "time": "24h"},
+            files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
+            headers=headers,
+            timeout=60,
+        )
+    response.raise_for_status()
+    url = response.text.strip()
+    if not url.startswith("https://"):
+        raise ValueError(f"Unexpected Litterbox response: {url[:200]}")
+    logger.info("[✓] Hosted at Litterbox — %s", url)
+    return url
+
+
+def upload_to_catbox(image_path: Path) -> str:
+    logger.info("Uploading image to Catbox...")
+    headers = {"User-Agent": BROWSER_USER_AGENT}
+    with image_path.open("rb") as handle:
+        response = requests.post(
+            "https://catbox.moe/user/api.php",
+            data={"reqtype": "fileupload"},
+            files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
+            headers=headers,
+            timeout=60,
+        )
+    response.raise_for_status()
+    url = response.text.strip()
+    if not url.startswith("https://"):
+        raise ValueError(f"Unexpected Catbox response: {url[:200]}")
+    logger.info("[✓] Hosted at Catbox — %s", url)
+    return url
+
+
+def host_image(image_path: Path) -> str:
+    uploaders: list[tuple[str, Any]] = [
+        ("Catbox", upload_to_catbox),
+        ("Litterbox", upload_to_litterbox),
+    ]
+    errors: list[str] = []
+
+    for name, upload in uploaders:
+        try:
+            url = upload(image_path)
+            if _verify_public_image_url(url):
+                return url
+            errors.append(f"{name}: URL does not serve image/* content-type")
+        except (requests.RequestException, ValueError) as exc:
+            errors.append(f"{name}: {exc}")
+            logger.warning("%s failed — trying next host...", name)
+
+    raise RuntimeError("All image hosts failed — " + "; ".join(errors))
+
+
+# ---------------------------------------------------------------------------
+# Stage 4 — Instagram Graph API Publishing
+# ---------------------------------------------------------------------------
+
+
+def _graph_request(method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
+    api_label = "Instagram Login API" if _uses_instagram_login_api() else "Facebook Graph API"
+    url = f"{_instagram_api_base()}/{endpoint.lstrip('/')}"
+    params = kwargs.pop("params", {})
+    params["access_token"] = INSTAGRAM_ACCESS_TOKEN
+
+    try:
+        response = requests.request(method, url, params=params, timeout=60, **kwargs)
+        data = response.json()
+    except requests.RequestException as exc:
+        raise RuntimeError(f"{api_label} request failed: {endpoint}") from exc
+
+    if not response.ok or "error" in data:
+        error = data.get("error", {})
+        message = error.get("message", response.text)
+        raise RuntimeError(f"{api_label} error: {message}")
+    return data
+
+
+def create_media_container(image_url: str, caption: str, account_id: str) -> str:
+    logger.info("Creating Instagram media container...")
+    data = _graph_request(
+        "POST",
+        f"{account_id}/media",
+        data={"image_url": image_url, "caption": caption},
+    )
+    creation_id = data.get("id")
+    if not creation_id:
+        raise RuntimeError("Media container response missing creation id")
+    logger.info("Media container created — id: %s", creation_id)
+    return creation_id
+
+
+def wait_for_container_ready(container_id: str) -> None:
+    logger.info("Polling container status...")
+    deadline = time.time() + POLL_MAX_WAIT_SECONDS
+    terminal_error_states = {"ERROR", "EXPIRED"}
+
+    while time.time() < deadline:
+        data = _graph_request("GET", container_id, params={"fields": "status_code,status"})
+        status = data.get("status_code", "UNKNOWN")
+        logger.info("Container status: %s", status)
+
+        if status == "FINISHED":
+            return
+        if status in terminal_error_states:
+            raise RuntimeError(f"Container entered terminal state: {status}")
+        if status == "PUBLISHED":
+            return
+        time.sleep(POLL_INTERVAL_SECONDS)
+
+    raise RuntimeError(f"Container not ready after {POLL_MAX_WAIT_SECONDS}s")
+
+
+def publish_media(container_id: str, account_id: str) -> str:
+    logger.info("Publishing to Instagram...")
+    data = _graph_request(
+        "POST",
+        f"{account_id}/media_publish",
+        data={"creation_id": container_id},
+    )
+    media_id = data.get("id")
+    if not media_id:
+        raise RuntimeError("Publish response missing media id")
+    logger.info("[✓] Published to Instagram — media id: %s", media_id)
+    return media_id
+
+
+def publish_to_instagram(image_url: str, caption: str) -> str:
+    account_id = _resolve_instagram_account_id()
+    container_id = create_media_container(image_url, caption, account_id)
+    wait_for_container_ready(container_id)
+    return publish_media(container_id, account_id)
+
+
+def post_comment(media_id: str, message: str) -> str:
+    """Post a comment on a published Instagram media object."""
+    logger.info("Posting answer comment on media %s...", media_id)
+    data = _graph_request(
+        "POST",
+        f"{media_id}/comments",
+        data={"message": message},
+    )
+    comment_id = data.get("id")
+    if not comment_id:
+        raise RuntimeError("Comment response missing id")
+    logger.info("[✓] Comment posted — id: %s", comment_id)
+    return comment_id
+
+
+def process_pending_comments() -> int:
+    """Post all scheduled comments whose delay has elapsed."""
+    pending = get_pending_comments()
+    if not pending:
+        logger.info("No pending comments to post")
+        return 0
+
+    posted = 0
+    for row in pending:
+        try:
+            post_comment(row["media_id"], row["comment_text"])
+            mark_comment_posted(row["id"])
+            posted += 1
+            logger.info("Answer comment posted for question id %s", row["id"])
+        except RuntimeError as exc:
+            logger.error("Failed to post comment for id %s: %s", row["id"], exc)
+    return posted
+
+
+def wait_and_post_comment(record_id: int, media_id: str, comment_text: str, scheduled_at: datetime) -> None:
+    """Sleep until scheduled time then post the answer comment."""
+    now = datetime.now(timezone.utc)
+    if scheduled_at > now:
+        wait_seconds = (scheduled_at - now).total_seconds()
+        logger.info("Waiting %.0f seconds until answer comment (scheduled at %s)", wait_seconds, scheduled_at.isoformat())
+        time.sleep(wait_seconds)
+    post_comment(media_id, comment_text)
+    mark_comment_posted(record_id)
+
+
+# ---------------------------------------------------------------------------
+# Pipeline Orchestration
+# ---------------------------------------------------------------------------
+
+
+def run_pipeline() -> None:
+    logger.info("=" * 60)
+    logger.info("F1 Paddock Quiz — Instagram Automation Pipeline")
+    logger.info("=" * 60)
+
+    validate_env()
+    init_db()
+
+    # Post any overdue comments from previous runs first
+    overdue = process_pending_comments()
+    if overdue:
+        logger.info("Posted %s overdue answer comment(s)", overdue)
+
+    content = generate_content()
+    record_id = record_question(content)
+
+    image_path = create_post_image(content)
+    public_url = host_image(image_path)
+    media_id = publish_to_instagram(public_url, content.full_caption())
+
+    scheduled_at = datetime.now(timezone.utc) + timedelta(hours=COMMENT_DELAY_HOURS)
+    comment_text = content.answer_comment()
+    mark_published(record_id, media_id, scheduled_at.isoformat(), comment_text)
+
+    logger.info(
+        "Answer comment scheduled for %s (%d hours after publish)",
+        scheduled_at.isoformat(),
+        COMMENT_DELAY_HOURS,
+    )
+
+    if WAIT_FOR_COMMENT:
+        wait_and_post_comment(record_id, media_id, comment_text, scheduled_at)
+    else:
+        logger.info(
+            "Run `python main.py --post-comments` after %s to publish the answer, "
+            "or set WAIT_FOR_COMMENT=true to wait in-process.",
+            scheduled_at.isoformat(),
+        )
+
+    logger.info("=" * 60)
+    logger.info("Pipeline complete!")
+    logger.info("  Question: %s", content.question)
+    logger.info("  Answer  : %s — %s", content.correct_option, content.options[content.correct_option])
+    logger.info("  Image   : %s", image_path.resolve())
+    logger.info("  URL     : %s", public_url)
+    logger.info("  Media ID: %s", media_id)
+    logger.info("=" * 60)
+
+
+def run_comment_job() -> None:
+    """Standalone job: post all due answer comments."""
+    validate_env()
+    init_db()
+    count = process_pending_comments()
+    logger.info("Comment job finished — %s comment(s) posted", count)
+
+
+def lookup_instagram_account_id() -> None:
+    if not INSTAGRAM_ACCESS_TOKEN:
+        raise EnvironmentError("INSTAGRAM_ACCESS_TOKEN is required for lookup")
+
+    if _uses_instagram_login_api():
+        data = _graph_request("GET", "me", params={"fields": "id,user_id,username,name,account_type"})
+        print("Token type: Instagram Login (IGAA...)")
+        print(f"  Username: @{data.get('username', 'unknown')}")
+        print(f"  INSTAGRAM_ACCOUNT_ID={data.get('user_id') or data.get('id')}")
+        return
+
+    logger.info("Looking up Instagram Business Account ID...")
+    response = requests.get(
+        f"{GRAPH_API_BASE}/me/accounts",
+        params={
+            "access_token": INSTAGRAM_ACCESS_TOKEN,
+            "fields": "id,name,instagram_business_account{id,username,name}",
+        },
+        timeout=30,
+    )
+    data = response.json()
+    if "error" in data:
+        raise RuntimeError(f"Graph API error: {data['error'].get('message')}")
+
+    for page in data.get("data", []):
+        ig = page.get("instagram_business_account") or {}
+        if ig.get("id"):
+            print(f"Page: {page.get('name')}")
+            print(f"  INSTAGRAM_ACCOUNT_ID={ig['id']}")
+            print(f"  Username: @{ig.get('username', 'unknown')}")
+
+
+def main() -> int:
+    if len(sys.argv) > 1 and sys.argv[1] == "--lookup-ig-id":
+        load_dotenv()
+        try:
+            lookup_instagram_account_id()
+            return 0
+        except (EnvironmentError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--show-history":
+        load_dotenv()
+        show_question_history()
+        return 0
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--post-comments":
+        load_dotenv()
+        try:
+            run_comment_job()
+            return 0
+        except (EnvironmentError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+
+    try:
+        run_pipeline()
+        return 0
+    except (EnvironmentError, RuntimeError) as exc:
+        logger.error("Pipeline failed: %s", exc)
+        return 1
+    except KeyboardInterrupt:
+        logger.warning("Pipeline interrupted by user")
+        return 130
+
+
+if __name__ == "__main__":
+    sys.exit(main())
