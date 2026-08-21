@@ -47,6 +47,9 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
+      - name: Install system fonts (fallback)
+        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
+
       - name: Run Quiz Post Automation
         env:
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}

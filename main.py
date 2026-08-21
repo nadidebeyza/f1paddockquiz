@@ -80,6 +80,7 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_IMAGE = BASE_DIR / "final_post.jpg"
 DATABASE_PATH = BASE_DIR / "database.db"
 FONT_PATH = BASE_DIR / "font.ttf"
+FONT_SANS_PATH = BASE_DIR / "fonts" / "Inter.ttf"
 FONT_DISPLAY_PATHS = (
     BASE_DIR / "font-display.ttf",
     BASE_DIR / "FodaDisplay-Regular.otf",
@@ -253,8 +254,7 @@ class QuizContent:
         correct_text = self.options[self.correct_option]
         return (
             f"✅ Correct Answer: {self.correct_option} — {correct_text}\n\n"
-            f"📖 Explanation:\n\n{self.explanation}\n\n"
-            f"{ANSWER_COMMENT_FOOTER}"
+            f"📖 Explanation:\n\n{self.explanation}"
         )
 
 
@@ -502,9 +502,9 @@ def _looks_like_placeholder(value: str | None) -> bool:
     return any(marker in lowered for marker in PLACEHOLDER_MARKERS)
 
 
-def validate_env() -> None:
+def validate_instagram_env() -> None:
+    """Validate credentials required for Instagram publish/comment only."""
     required = {
-        "GEMINI_API_KEY": GEMINI_API_KEY,
         "INSTAGRAM_ACCESS_TOKEN": INSTAGRAM_ACCESS_TOKEN,
     }
     if not _uses_instagram_login_api():
@@ -520,18 +520,28 @@ def validate_env() -> None:
             f"{', '.join(placeholders)} still contain placeholder values in .env."
         )
 
-    if not GEMINI_API_KEY.startswith(("AIza", "AQ.")):
-        raise EnvironmentError(
-            "GEMINI_API_KEY must start with 'AIza' or 'AQ.' from "
-            "https://aistudio.google.com/apikey"
-        )
-
     if not _uses_instagram_login_api():
         if not INSTAGRAM_ACCOUNT_ID.isdigit():
             raise EnvironmentError(
                 f"INSTAGRAM_ACCOUNT_ID must be numeric, not '{INSTAGRAM_ACCOUNT_ID}'. "
                 "Run: python main.py --lookup-ig-id"
             )
+
+
+def validate_env() -> None:
+    validate_instagram_env()
+
+    if not GEMINI_API_KEY:
+        raise EnvironmentError("Missing required environment variables: GEMINI_API_KEY")
+
+    if _looks_like_placeholder(GEMINI_API_KEY):
+        raise EnvironmentError("GEMINI_API_KEY still contains placeholder values in .env.")
+
+    if not GEMINI_API_KEY.startswith(("AIza", "AQ.")):
+        raise EnvironmentError(
+            "GEMINI_API_KEY must start with 'AIza' or 'AQ.' from "
+            "https://aistudio.google.com/apikey"
+        )
 
 
 def _gemini_models_to_try() -> list[str]:
@@ -644,6 +654,11 @@ def generate_content() -> QuizContent:
 
 def _sans_font_candidates(bold: bool = False) -> list[Path]:
     candidates: list[Path] = []
+    env_path = os.getenv("SANS_FONT_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    if FONT_SANS_PATH.exists():
+        candidates.append(FONT_SANS_PATH)
     if FONT_PATH.exists():
         candidates.append(FONT_PATH)
 
@@ -661,9 +676,12 @@ def _sans_font_candidates(bold: bool = False) -> list[Path]:
                 Path("/Library/Fonts/Arial.ttf"),
             ])
     elif sys.platform.startswith("linux"):
-        candidates.append(
-            Path("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf")
-        )
+        dejavu_name = "DejaVuSans-Bold.ttf" if bold else "DejaVuSans.ttf"
+        candidates.extend([
+            Path(f"/usr/share/fonts/truetype/dejavu/{dejavu_name}"),
+            Path(f"/usr/share/fonts/dejavu/{dejavu_name}"),
+            Path(f"/usr/share/fonts/truetype/liberation/LiberationSans-Bold.ttf" if bold else "/usr/share/fonts/truetype/liberation/LiberationSans-Regular.ttf"),
+        ])
     else:
         candidates.append(
             Path("C:/Windows/Fonts/arialbd.ttf" if bold else "C:/Windows/Fonts/arial.ttf")
@@ -709,15 +727,64 @@ def _load_display_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFon
     return _load_font(size, bold=True)
 
 
+def _apply_sans_weight(
+    font: ImageFont.FreeTypeFont,
+    *,
+    bold: bool,
+) -> ImageFont.FreeTypeFont:
+    if not bold:
+        return font
+    try:
+        axes = font.get_variation_axes()
+    except OSError:
+        return font
+    if not axes:
+        return font
+    values = [axis["default"] for axis in axes]
+    for index, axis in enumerate(axes):
+        if axis.get("name") == b"Weight" or index == 1:
+            values[index] = min(700, axis["maximum"])
+            break
+    try:
+        font.set_variation_by_axes(values)
+    except OSError:
+        pass
+    return font
+
+
+def _load_bundled_sans_font(
+    size: int,
+    *,
+    bold: bool = False,
+) -> ImageFont.FreeTypeFont | None:
+    if not FONT_SANS_PATH.exists():
+        return None
+    try:
+        font = ImageFont.truetype(str(FONT_SANS_PATH), size=size)
+        font = _apply_sans_weight(font, bold=bold)
+        logger.info("Bundled sans font loaded: %s (size %s, bold=%s)", FONT_SANS_PATH.name, size, bold)
+        return font
+    except OSError:
+        return None
+
+
 def _load_font(
     size: int,
     *,
     bold: bool = False,
 ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    bundled = _load_bundled_sans_font(size, bold=bold)
+    if bundled is not None:
+        return bundled
+
     for path in _sans_font_candidates(bold=bold):
+        if path == FONT_SANS_PATH:
+            continue
         if path.exists():
             try:
-                return ImageFont.truetype(str(path), size=size)
+                font = ImageFont.truetype(str(path), size=size)
+                logger.info("Sans font loaded: %s (size %s, bold=%s)", path.name, size, bold)
+                return font
             except OSError:
                 continue
     logger.warning("No sans-serif font found — using Pillow default")
@@ -1364,6 +1431,12 @@ def post_comment(media_id: str, message: str) -> str:
     return comment_id
 
 
+def post_disclaimer_comment(media_id: str) -> str:
+    """Post the fixed disclaimer as the first comment on a published post."""
+    logger.info("Posting disclaimer as first comment on media %s...", media_id)
+    return post_comment(media_id, ANSWER_COMMENT_FOOTER)
+
+
 def process_pending_comments() -> int:
     """Post all scheduled comments whose delay has elapsed."""
     pending = get_pending_comments()
@@ -1462,6 +1535,11 @@ def run_pipeline(image_only: bool = False) -> None:
     public_url = host_image(image_path)
     media_id = publish_to_instagram(public_url, content.full_caption())
 
+    try:
+        post_disclaimer_comment(media_id)
+    except RuntimeError as exc:
+        logger.error("Failed to post disclaimer comment: %s", exc)
+
     scheduled_at = datetime.now(timezone.utc) + timedelta(hours=COMMENT_DELAY_HOURS)
     comment_text = content.answer_comment()
     mark_published(record_id, media_id, scheduled_at.isoformat(), comment_text)
@@ -1493,7 +1571,7 @@ def run_pipeline(image_only: bool = False) -> None:
 
 def run_comment_job() -> None:
     """Standalone job: post all due answer comments."""
-    validate_env()
+    validate_instagram_env()
     init_db()
     count = process_pending_comments()
     logger.info("Comment job finished — %s comment(s) posted", count)
