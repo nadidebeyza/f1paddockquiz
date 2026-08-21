@@ -95,6 +95,13 @@ DUPLICATE_CONTENT_RETRIES = int(os.getenv("DUPLICATE_CONTENT_RETRIES", "5"))
 COMMENT_DELAY_HOURS = int(os.getenv("COMMENT_DELAY_HOURS", "3"))
 WAIT_FOR_COMMENT = os.getenv("WAIT_FOR_COMMENT", "").lower() in ("1", "true", "yes")
 
+ANSWER_COMMENT_FOOTER = (
+    "All facts are drawn from publicly available Formula 1 records and are shared "
+    "for educational and entertainment purposes only.\n\n"
+    "If you believe any detail is inaccurate, comment below and we will verify "
+    "against official sources and correct if needed."
+)
+
 CONTENT_JSON_SCHEMA: dict[str, Any] = {
     "type": "object",
     "properties": {
@@ -246,7 +253,8 @@ class QuizContent:
         correct_text = self.options[self.correct_option]
         return (
             f"✅ Correct Answer: {self.correct_option} — {correct_text}\n\n"
-            f"📖 Explanation:\n\n{self.explanation}"
+            f"📖 Explanation:\n\n{self.explanation}\n\n"
+            f"{ANSWER_COMMENT_FOOTER}"
         )
 
 

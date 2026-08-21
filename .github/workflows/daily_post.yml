@@ -2,7 +2,9 @@ name: F1 Paddock Quiz — Daily Post & Answer Comment
 
 on:
   schedule:
-    # Daily feed post — UTC 17:00 (Turkey 20:00)
+    # Post 1 — UTC 09:00 (Turkey 12:00)
+    - cron: '0 9 * * *'
+    # Post 2 — UTC 17:00 (Turkey 20:00)
     - cron: '0 17 * * *'
     # Answer comments — every hour (posts when 3h delay has elapsed)
     - cron: '0 * * * *'
@@ -18,7 +20,10 @@ concurrency:
 
 jobs:
   run-post:
-    if: github.event.schedule == '0 17 * * *' || github.event_name == 'workflow_dispatch'
+    if: >-
+      github.event_name == 'workflow_dispatch' ||
+      github.event.schedule == '0 9 * * *' ||
+      github.event.schedule == '0 17 * * *'
     runs-on: ubuntu-latest
 
     steps:
