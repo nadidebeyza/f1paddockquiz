@@ -9,6 +9,7 @@ Duplicate questions are blocked via SQLite (30-day rolling window).
 
 from __future__ import annotations
 
+import base64
 import hashlib
 import json
 import logging
@@ -51,6 +52,8 @@ GEMINI_FALLBACK_MODELS = [
 INSTAGRAM_ACCOUNT_ID = (os.getenv("INSTAGRAM_ACCOUNT_ID") or "").strip()
 INSTAGRAM_ACCESS_TOKEN = (os.getenv("INSTAGRAM_ACCESS_TOKEN") or "").strip().strip('"').strip("'")
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "")
+IMGUR_CLIENT_ID = (os.getenv("IMGUR_CLIENT_ID") or "").strip()
+GITHUB_HOST_PATH = os.getenv("GITHUB_HOST_PATH", "public/latest_post.jpg")
 
 GRAPH_API_VERSION = "v26.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -885,10 +888,48 @@ BROWSER_USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
 )
+CATBOX_HEADERS = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Referer": "https://catbox.moe/",
+    "Origin": "https://catbox.moe",
+    "Accept": "*/*",
+}
+LITTERBOX_HEADERS = {
+    "User-Agent": BROWSER_USER_AGENT,
+    "Referer": "https://litterbox.catbox.moe/",
+    "Origin": "https://litterbox.catbox.moe",
+    "Accept": "*/*",
+}
+
+
+def _github_branch() -> str:
+    ref = os.getenv("GITHUB_REF", "refs/heads/main")
+    if ref.startswith("refs/heads/"):
+        return ref.removeprefix("refs/heads/")
+    if ref.startswith("refs/tags/"):
+        return ref.removeprefix("refs/tags/")
+    return "main"
+
+
+def _github_repository() -> str | None:
+    repo = (os.getenv("GITHUB_REPOSITORY") or "").strip()
+    return repo if "/" in repo else None
+
+
+def _github_token() -> str | None:
+    token = (os.getenv("GITHUB_TOKEN") or os.getenv("GH_TOKEN") or "").strip()
+    return token or None
 
 
 def _verify_public_image_url(url: str) -> bool:
+    """Return True when URL serves a direct image Instagram can fetch."""
     headers = {"User-Agent": BROWSER_USER_AGENT}
+    trusted_prefixes = (
+        "https://files.catbox.moe/",
+        "https://litter.catbox.moe/",
+        "https://i.imgur.com/",
+        "https://raw.githubusercontent.com/",
+    )
     try:
         response = requests.head(url, headers=headers, timeout=30, allow_redirects=True)
         if response.status_code >= 400:
@@ -904,56 +945,151 @@ def _verify_public_image_url(url: str) -> bool:
         if "text/html" in content_type:
             return False
     except requests.RequestException as exc:
-        if url.startswith(("https://files.catbox.moe/", "https://litter.catbox.moe/")):
-            logger.warning("Could not probe %s (%s) — trusting CDN URL", url, exc)
+        if any(url.startswith(prefix) for prefix in trusted_prefixes):
+            logger.warning(
+                "Could not probe %s locally (%s) — trusting known CDN URL",
+                url,
+                exc,
+            )
             return True
         return False
     return False
 
 
-def upload_to_litterbox(image_path: Path) -> str:
-    logger.info("Uploading image to Litterbox...")
-    headers = {"User-Agent": BROWSER_USER_AGENT}
-    with image_path.open("rb") as handle:
-        response = requests.post(
-            "https://litterbox.catbox.moe/resources/internals/api.php",
-            data={"reqtype": "fileupload", "time": "24h"},
-            files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
-            headers=headers,
-            timeout=60,
+def upload_to_imgur(image_path: Path) -> str:
+    """Upload to Imgur — reliable public URL for Instagram Graph API."""
+    if not IMGUR_CLIENT_ID:
+        raise ValueError("IMGUR_CLIENT_ID not configured")
+
+    logger.info("Uploading image to Imgur...")
+    try:
+        with image_path.open("rb") as handle:
+            response = requests.post(
+                "https://api.imgur.com/3/image",
+                headers={"Authorization": f"Client-ID {IMGUR_CLIENT_ID}"},
+                files={"image": (image_path.name, handle, "image/jpeg")},
+                timeout=60,
+            )
+        response.raise_for_status()
+        payload = response.json()
+        if not payload.get("success"):
+            raise ValueError(f"Imgur API error: {payload}")
+        data = payload.get("data", {})
+        url = data.get("link") or data.get("url")
+        if not url or not str(url).startswith("https://"):
+            raise ValueError(f"Unexpected Imgur response: {payload}")
+        logger.info("[✓] Hosted at Imgur — %s", url)
+        return str(url)
+    except (requests.RequestException, ValueError, TypeError) as exc:
+        logger.exception("Imgur upload failed")
+        raise RuntimeError("Imgur upload failed") from exc
+
+
+def upload_to_github_contents(image_path: Path) -> str:
+    """Publish image to the repo via GitHub API — works from GitHub Actions runners."""
+    token = _github_token()
+    repo = _github_repository()
+    if not token or not repo:
+        raise ValueError("GITHUB_TOKEN and GITHUB_REPOSITORY required for GitHub hosting")
+
+    owner, repo_name = repo.split("/", 1)
+    branch = _github_branch()
+    path = GITHUB_HOST_PATH
+    api_url = f"https://api.github.com/repos/{owner}/{repo_name}/contents/{path}"
+    headers = {
+        "Authorization": f"Bearer {token}",
+        "Accept": "application/vnd.github+json",
+        "X-GitHub-Api-Version": "2022-11-28",
+    }
+    content_b64 = base64.b64encode(image_path.read_bytes()).decode("ascii")
+    body: dict[str, Any] = {
+        "message": "ci: update Instagram post image",
+        "content": content_b64,
+        "branch": branch,
+    }
+
+    logger.info("Uploading image to GitHub Contents API (%s on %s)...", path, branch)
+    try:
+        existing = requests.get(api_url, headers=headers, params={"ref": branch}, timeout=30)
+        if existing.status_code == 200:
+            sha = existing.json().get("sha")
+            if sha:
+                body["sha"] = sha
+
+        response = requests.put(api_url, headers=headers, json=body, timeout=60)
+        response.raise_for_status()
+        url = (
+            f"https://raw.githubusercontent.com/{owner}/{repo_name}/{branch}/{path}"
         )
-    response.raise_for_status()
-    url = response.text.strip()
-    if not url.startswith("https://"):
-        raise ValueError(f"Unexpected Litterbox response: {url[:200]}")
-    logger.info("[✓] Hosted at Litterbox — %s", url)
-    return url
+        logger.info("[✓] Hosted on GitHub — %s", url)
+        return url
+    except requests.RequestException as exc:
+        logger.exception("GitHub Contents upload failed")
+        raise RuntimeError("GitHub Contents upload failed") from exc
+
+
+def upload_to_litterbox(image_path: Path) -> str:
+    """Upload to Litterbox — direct files.catbox.moe-style JPEG URL for Instagram."""
+    logger.info("Uploading image to Litterbox...")
+    try:
+        with image_path.open("rb") as handle:
+            response = requests.post(
+                "https://litterbox.catbox.moe/resources/internals/api.php",
+                data={"reqtype": "fileupload", "time": "24h"},
+                files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
+                headers=LITTERBOX_HEADERS,
+                timeout=60,
+            )
+        response.raise_for_status()
+        url = response.text.strip()
+        if not url.startswith("https://"):
+            raise ValueError(f"Unexpected Litterbox response: {url[:200]}")
+        logger.info("[✓] Hosted at Litterbox — %s", url)
+        return url
+    except (requests.RequestException, ValueError) as exc:
+        logger.exception("Litterbox upload failed")
+        raise RuntimeError("Litterbox upload failed") from exc
 
 
 def upload_to_catbox(image_path: Path) -> str:
+    """Upload to catbox.moe with browser-like headers."""
     logger.info("Uploading image to Catbox...")
-    headers = {"User-Agent": BROWSER_USER_AGENT}
-    with image_path.open("rb") as handle:
-        response = requests.post(
-            "https://catbox.moe/user/api.php",
-            data={"reqtype": "fileupload"},
-            files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
-            headers=headers,
-            timeout=60,
-        )
-    response.raise_for_status()
-    url = response.text.strip()
-    if not url.startswith("https://"):
-        raise ValueError(f"Unexpected Catbox response: {url[:200]}")
-    logger.info("[✓] Hosted at Catbox — %s", url)
-    return url
+    try:
+        with image_path.open("rb") as handle:
+            response = requests.post(
+                "https://catbox.moe/user/api.php",
+                data={"reqtype": "fileupload"},
+                files={"fileToUpload": (image_path.name, handle, "image/jpeg")},
+                headers=CATBOX_HEADERS,
+                timeout=60,
+            )
+        response.raise_for_status()
+        url = response.text.strip()
+        if not url.startswith("https://"):
+            raise ValueError(f"Unexpected Catbox response: {url[:200]}")
+        logger.info("[✓] Hosted at Catbox — %s", url)
+        return url
+    except (requests.RequestException, ValueError) as exc:
+        logger.exception("Catbox upload failed")
+        raise RuntimeError("Catbox upload failed") from exc
 
 
 def host_image(image_path: Path) -> str:
-    uploaders: list[tuple[str, Any]] = [
+    """Upload and return an Instagram-compatible direct image URL."""
+    uploaders: list[tuple[str, Any]] = []
+
+    if IMGUR_CLIENT_ID:
+        uploaders.append(("Imgur", upload_to_imgur))
+
+    # GitHub Actions: Catbox often returns 412 from datacenter IPs — prefer GitHub hosting
+    if _github_token() and _github_repository():
+        uploaders.append(("GitHub", upload_to_github_contents))
+
+    uploaders.extend([
         ("Catbox", upload_to_catbox),
         ("Litterbox", upload_to_litterbox),
-    ]
+    ])
+
     errors: list[str] = []
 
     for name, upload in uploaders:
@@ -961,8 +1097,13 @@ def host_image(image_path: Path) -> str:
             url = upload(image_path)
             if _verify_public_image_url(url):
                 return url
+            logger.warning(
+                "%s URL is not a direct image (Instagram would reject it): %s",
+                name,
+                url,
+            )
             errors.append(f"{name}: URL does not serve image/* content-type")
-        except (requests.RequestException, ValueError) as exc:
+        except (RuntimeError, requests.RequestException, ValueError) as exc:
             errors.append(f"{name}: {exc}")
             logger.warning("%s failed — trying next host...", name)
 
