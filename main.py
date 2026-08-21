@@ -13,7 +13,6 @@ import base64
 import hashlib
 import json
 import logging
-import math
 import os
 import re
 import sqlite3
@@ -62,8 +61,14 @@ INSTAGRAM_LOGIN_API_BASE = f"https://graph.instagram.com/{INSTAGRAM_LOGIN_API_VE
 
 CANVAS_WIDTH = 1080
 CANVAS_HEIGHT = 1350
-CARD_INSET = 80
+CARD_WIDTH = 780
+QUIZ_FONT_SIZE = 230
+QUIZ_STROKE_WIDTH = 12
+QUIZ_SHIFT_LEFT = 120
+F1_BADGE_SHIFT_RIGHT = 190
+F1_BADGE_OVERLAP = 72
 COLOR_BLACK = (17, 17, 17)
+COLOR_BG = (0, 0, 0)
 COLOR_WHITE = (255, 255, 255)
 COLOR_GRAY_TEXT = (17, 17, 17)
 COLOR_OPTION_BG = (240, 240, 240)
@@ -75,6 +80,13 @@ BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_IMAGE = BASE_DIR / "final_post.jpg"
 DATABASE_PATH = BASE_DIR / "database.db"
 FONT_PATH = BASE_DIR / "font.ttf"
+FONT_DISPLAY_PATHS = (
+    BASE_DIR / "font-display.ttf",
+    BASE_DIR / "FodaDisplay-Regular.otf",
+    BASE_DIR / "Foda Display Regular.otf",
+    BASE_DIR / "FodaDisplay-Regular.ttf",
+    BASE_DIR / "foda-display.ttf",
+)
 
 POLL_INTERVAL_SECONDS = 5
 POLL_MAX_WAIT_SECONDS = 30
@@ -141,6 +153,7 @@ Rules:
 - options MUST have exactly 4 choices labeled A, B, C, D — all plausible but one correct
 - correct_option MUST be exactly one of: A, B, C, or D
 - explanation MUST be 2-4 sentences with specific facts (years, races, numbers)
+- explanation MUST be split into 2-3 short mini-paragraphs separated by blank lines (\\n\\n) — each block 1-2 sentences max for mobile readability
 - caption MUST include a hook, invite comments (A/B/C/D), note answer in 3 hours, and hashtags
 - caption MUST be plain text — no markdown (**bold**, etc.)
 - NEVER repeat any question listed in the "Recently published — DO NOT REUSE" section
@@ -172,6 +185,28 @@ def _normalize_question(text: str) -> str:
     return re.sub(r"\s+", " ", lowered)
 
 
+def _format_explanation_paragraphs(text: str) -> str:
+    """Split explanation into short mini-paragraphs for Instagram comment readability."""
+    text = text.strip()
+    if not text:
+        return text
+
+    if re.search(r"\n\s*\n", text):
+        paragraphs = [block.strip() for block in re.split(r"\n\s*\n", text) if block.strip()]
+        return "\n\n".join(paragraphs)
+
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if len(sentences) <= 1:
+        return text
+
+    paragraphs: list[str] = []
+    for index in range(0, len(sentences), 2):
+        chunk = " ".join(sentences[index : index + 2]).strip()
+        if chunk:
+            paragraphs.append(chunk)
+    return "\n\n".join(paragraphs)
+
+
 def _question_hash(text: str) -> str:
     normalized = _normalize_question(text)
     return hashlib.sha256(normalized.encode("utf-8")).hexdigest()
@@ -200,7 +235,7 @@ class QuizContent:
             question=question,
             options=options,
             correct_option=correct,
-            explanation=_strip_markdown(data["explanation"].strip()),
+            explanation=_format_explanation_paragraphs(_strip_markdown(data["explanation"].strip())),
             caption=_strip_markdown(data["caption"].strip()),
         )
 
@@ -211,7 +246,7 @@ class QuizContent:
         correct_text = self.options[self.correct_option]
         return (
             f"✅ Correct Answer: {self.correct_option} — {correct_text}\n\n"
-            f"📖 Explanation:\n{self.explanation}"
+            f"📖 Explanation:\n\n{self.explanation}"
         )
 
 
@@ -409,11 +444,32 @@ def _instagram_api_base() -> str:
     return INSTAGRAM_LOGIN_API_BASE if _uses_instagram_login_api() else GRAPH_API_BASE
 
 
+def _format_graph_api_error(error: dict[str, Any], api_label: str) -> str:
+    message = error.get("message", "Unknown error")
+    code = error.get("code")
+    if code == 200 or "access blocked" in message.lower():
+        return (
+            f"{api_label} error: {message}\n"
+            "Meta blocked Instagram API access for this token or app. Try:\n"
+            "  1. https://developers.facebook.com/tools/debug/accesstoken/ — check token expiry\n"
+            "  2. Meta Developer Console → your app → generate a new Instagram access token\n"
+            "  3. Required scopes: instagram_business_basic, instagram_business_content_publish\n"
+            "  4. App must be Live with Advanced Access (Development mode only works for testers)\n"
+            "  5. Meta Business Suite → Instagram accounts → reconnect @f1paddockquiz to the app"
+        )
+    return f"{api_label} error: {message}"
+
+
 def _resolve_instagram_account_id() -> str:
-    if not _uses_instagram_login_api():
-        if not INSTAGRAM_ACCOUNT_ID:
-            raise EnvironmentError("INSTAGRAM_ACCOUNT_ID is required for Facebook Login tokens")
+    if INSTAGRAM_ACCOUNT_ID and INSTAGRAM_ACCOUNT_ID.isdigit():
+        logger.info("Using Instagram account id from .env: %s", INSTAGRAM_ACCOUNT_ID)
         return INSTAGRAM_ACCOUNT_ID
+
+    if not _uses_instagram_login_api():
+        raise EnvironmentError(
+            "INSTAGRAM_ACCOUNT_ID is required for Facebook Login tokens. "
+            "Run: python main.py --lookup-ig-id"
+        )
 
     logger.info("Resolving Instagram account via Instagram Login API (/me)...")
     data = _graph_request("GET", "me", params={"fields": "id,user_id,username"})
@@ -607,6 +663,44 @@ def _sans_font_candidates(bold: bool = False) -> list[Path]:
     return candidates
 
 
+def _display_font_candidates() -> list[Path]:
+    """Foda Display paths for the F1 Paddock Quiz header badge."""
+    candidates: list[Path] = []
+    env_path = os.getenv("FODA_DISPLAY_FONT_PATH")
+    if env_path:
+        candidates.append(Path(env_path))
+    candidates.extend(FONT_DISPLAY_PATHS)
+
+    if sys.platform == "darwin":
+        candidates.extend([
+            Path.home() / "Library/Fonts/Foda Display Regular.otf",
+            Path.home() / "Library/Fonts/FodaDisplay-Regular.otf",
+            Path("/Library/Fonts/Foda Display Regular.otf"),
+            Path("/Library/Fonts/FodaDisplay-Regular.otf"),
+        ])
+    elif sys.platform.startswith("linux"):
+        candidates.extend([
+            Path.home() / ".local/share/fonts/FodaDisplay-Regular.otf",
+            Path("/usr/local/share/fonts/FodaDisplay-Regular.otf"),
+        ])
+    else:
+        candidates.append(Path("C:/Windows/Fonts/FodaDisplay-Regular.otf"))
+    return candidates
+
+
+def _load_display_font(size: int) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+    for path in _display_font_candidates():
+        if path.exists():
+            try:
+                font = ImageFont.truetype(str(path), size=size)
+                logger.info("Foda Display loaded: %s (size %s)", path.name, size)
+                return font
+            except OSError:
+                continue
+    logger.warning("Foda Display not found — falling back to sans-serif for header")
+    return _load_font(size, bold=True)
+
+
 def _load_font(
     size: int,
     *,
@@ -662,29 +756,9 @@ def _wrap_text(
     return lines
 
 
-def _draw_wavy_checkerboard(width: int, height: int) -> Image.Image:
-    """Retro racing-flag aesthetic — monochrome wavy checkerboard."""
-    canvas = Image.new("RGB", (width, height), COLOR_BLACK)
-    draw = ImageDraw.Draw(canvas)
-    cell = 56
-
-    for row in range(-3, height // cell + 4):
-        wave_x = int(28 * math.sin(row * 0.55))
-        wave_y = int(12 * math.cos(row * 0.35))
-        for col in range(-3, width // cell + 4):
-            x = col * cell + wave_x
-            y = row * cell + wave_y + int(8 * math.sin(col * 0.4))
-            fill = COLOR_WHITE if (row + col) % 2 == 0 else (22, 22, 22)
-            draw.rectangle([x, y, x + cell + 4, y + cell + 4], fill=fill)
-
-    # Subtle vignette for depth
-    vignette = Image.new("L", (width, height), 0)
-    vdraw = ImageDraw.Draw(vignette)
-    vdraw.ellipse([-width * 0.1, -height * 0.05, width * 1.1, height * 1.05], fill=180)
-    vignette = vignette.filter(ImageFilter.GaussianBlur(radius=120))
-    dark_layer = Image.new("RGB", (width, height), (0, 0, 0))
-    canvas = Image.composite(dark_layer, canvas, Image.eval(vignette, lambda p: 255 - p))
-    return canvas
+def _create_background(width: int, height: int) -> Image.Image:
+    """Solid black canvas background."""
+    return Image.new("RGB", (width, height), COLOR_BG)
 
 
 def _rounded_rect(
@@ -698,36 +772,6 @@ def _rounded_rect(
     draw.rounded_rectangle(xy, radius=radius, fill=fill, outline=outline, width=width)
 
 
-def _draw_dashed_curve(
-    draw: ImageDraw.ImageDraw,
-    start: tuple[int, int],
-    end: tuple[int, int],
-    *,
-    color: tuple[int, int, int] = (120, 120, 120),
-    dash: int = 10,
-    gap: int = 8,
-    width: int = 3,
-) -> None:
-    """Draw a dashed quadratic curve from start toward end."""
-    cx = (start[0] + end[0]) // 2
-    cy = start[1] - 40
-    steps = 48
-    points: list[tuple[int, int]] = []
-    for i in range(steps + 1):
-        t = i / steps
-        x = int((1 - t) ** 2 * start[0] + 2 * (1 - t) * t * cx + t ** 2 * end[0])
-        y = int((1 - t) ** 2 * start[1] + 2 * (1 - t) * t * cy + t ** 2 * end[1])
-        points.append((x, y))
-
-    segment = 0
-    for i in range(len(points) - 1):
-        if segment < dash:
-            draw.line([points[i], points[i + 1]], fill=color, width=width)
-        segment += 1
-        if segment >= dash + gap:
-            segment = 0
-
-
 def _draw_option_row(
     draw: ImageDraw.ImageDraw,
     x: int,
@@ -737,53 +781,184 @@ def _draw_option_row(
     font_letter: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     font_option: ImageFont.FreeTypeFont | ImageFont.ImageFont,
     max_width: int,
-    row_height: int = 72,
+    row_height: int = 84,
 ) -> int:
-    letter_w = 52
-    letter_h = row_height
-    gap = 14
-    text_x = x + letter_w + gap
-    text_max_w = max_width - letter_w - gap
-
-    _rounded_rect(draw, (x, y, x + letter_w, y + letter_h), radius=letter_h // 2, fill=COLOR_LETTER_BG)
-    letter_bbox = draw.textbbox((0, 0), letter, font=font_letter)
-    letter_tx = x + (letter_w - (letter_bbox[2] - letter_bbox[0])) // 2
-    letter_ty = y + (letter_h - (letter_bbox[3] - letter_bbox[1])) // 2 - letter_bbox[1]
-    draw.text((letter_tx, letter_ty), letter, font=font_letter, fill=COLOR_LETTER_TEXT)
-
-    lines = _wrap_text(text, font_option, text_max_w - 32)
-    line_h = _line_height(font_option)
-    pill_h = max(row_height, len(lines) * line_h + 28)
-    pill_w = text_max_w
+    """Option row — letter pill + full-width black rounded bar (reference layout)."""
+    letter_label = f"{letter}."
+    letter_w = 56
+    gap = 12
+    bar_x = x + letter_w + gap
+    bar_w = max_width - letter_w - gap
 
     _rounded_rect(
         draw,
-        (text_x, y, text_x + pill_w, y + pill_h),
-        radius=pill_h // 2,
-        fill=COLOR_OPTION_BG,
-        outline=(220, 220, 220),
-        width=1,
+        (x, y, x + letter_w, y + row_height),
+        radius=row_height // 2,
+        fill=COLOR_BLACK,
+    )
+    letter_bbox = draw.textbbox((0, 0), letter_label, font=font_letter)
+    letter_tx = x + (letter_w - (letter_bbox[2] - letter_bbox[0])) // 2
+    letter_ty = y + (row_height - (letter_bbox[3] - letter_bbox[1])) // 2 - letter_bbox[1]
+    draw.text((letter_tx, letter_ty), letter_label, font=font_letter, fill=COLOR_WHITE)
+
+    lines = _wrap_text(text, font_option, bar_w - 48)
+    line_h = _line_height(font_option)
+    bar_h = max(row_height, len(lines) * line_h + 24)
+
+    _rounded_rect(
+        draw,
+        (bar_x, y, bar_x + bar_w, y + bar_h),
+        radius=bar_h // 2,
+        fill=COLOR_BLACK,
     )
 
-    ty = y + (pill_h - len(lines) * line_h) // 2
+    ty = y + (bar_h - len(lines) * line_h) // 2
     for line in lines:
-        draw.text((text_x + 24, ty), line, font=font_option, fill=COLOR_GRAY_TEXT)
+        draw.text((bar_x + 24, ty), line, font=font_option, fill=COLOR_WHITE)
         ty += line_h
 
-    return y + pill_h + 20
+    return y + bar_h + 18
+
+
+def _measure_option_row_height(
+    text: str,
+    font_option: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    max_width: int,
+    row_height: int = 84,
+) -> int:
+    letter_w = 56
+    gap = 12
+    bar_w = max_width - letter_w - gap
+    lines = _wrap_text(text, font_option, bar_w - 48)
+    line_h = _line_height(font_option)
+    bar_h = max(row_height, len(lines) * line_h + 24)
+    return bar_h + 18
+
+
+def _quiz_half_height(
+    font_quiz_huge: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> int:
+    """Vertical half of QUIZ text (incl. stroke) for card-edge alignment."""
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    probe = measure.textbbox((0, 0), "QUIZ", font=font_quiz_huge, stroke_width=QUIZ_STROKE_WIDTH)
+    return (probe[3] - probe[1]) // 2
+
+
+def _layout_header(
+    card_left: int,
+    card_right: int,
+    card_top: int,
+    font_quiz_huge: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+    font_f1_badge: ImageFont.FreeTypeFont | ImageFont.ImageFont,
+) -> dict[str, Any]:
+    """QUIZ centered on card; F1 PADDOCK badge overlaid on QUIZ from the right."""
+    quiz_text = "QUIZ"
+    f1_text = "F1 PADDOCK"
+    f1_pad_x = 40
+    f1_pad_y = 16
+
+    f1_w = _text_width(f1_text, font_f1_badge) + f1_pad_x * 2
+    f1_h = _line_height(font_f1_badge) + f1_pad_y * 2
+    card_center_x = (card_left + card_right) // 2
+
+    measure = ImageDraw.Draw(Image.new("RGB", (1, 1)))
+    probe = measure.textbbox((0, 0), quiz_text, font=font_quiz_huge, stroke_width=QUIZ_STROKE_WIDTH)
+    text_h = probe[3] - probe[1]
+    quiz_w = probe[2] - probe[0]
+    quiz_y = card_top - probe[1] - text_h // 2
+    quiz_x = card_center_x - quiz_w // 2 - QUIZ_SHIFT_LEFT
+
+    quiz_bbox = measure.textbbox(
+        (quiz_x, quiz_y),
+        quiz_text,
+        font=font_quiz_huge,
+        stroke_width=QUIZ_STROKE_WIDTH,
+    )
+
+    qui_bbox = measure.textbbox(
+        (quiz_x, quiz_y),
+        "QUI",
+        font=font_quiz_huge,
+        stroke_width=QUIZ_STROKE_WIDTH,
+    )
+    z_bbox = measure.textbbox(
+        (qui_bbox[2], quiz_y),
+        "Z",
+        font=font_quiz_huge,
+        stroke_width=QUIZ_STROKE_WIDTH,
+    )
+    z_center_y = (z_bbox[1] + z_bbox[3]) // 2
+
+    f1_x = quiz_bbox[2] - f1_w + F1_BADGE_OVERLAP + F1_BADGE_SHIFT_RIGHT
+    f1_y = z_center_y - f1_h // 2
+    header_bottom = max(quiz_bbox[3], f1_y + f1_h)
+
+    return {
+        "quiz_text": quiz_text,
+        "f1_text": f1_text,
+        "quiz_x": quiz_x,
+        "quiz_y": quiz_y,
+        "quiz_bbox": quiz_bbox,
+        "f1_x": f1_x,
+        "f1_y": f1_y,
+        "f1_w": f1_w,
+        "f1_h": f1_h,
+        "header_bottom": header_bottom,
+        "quiz_half_h": text_h // 2,
+    }
 
 
 def create_post_image(content: QuizContent) -> Path:
-    """Compose branded F1 quiz image on wavy checkerboard background."""
+    """Compose branded F1 quiz image on solid black background."""
     logger.info("Creating F1 quiz post image...")
     try:
-        canvas = _draw_wavy_checkerboard(CANVAS_WIDTH, CANVAS_HEIGHT)
-
-        card_left = CARD_INSET
-        card_top = CARD_INSET + 40
-        card_right = CANVAS_WIDTH - CARD_INSET
-        card_bottom = CANVAS_HEIGHT - CARD_INSET
         card_radius = 36
+        card_bottom_pad = 44
+        card_left = (CANVAS_WIDTH - CARD_WIDTH) // 2
+        card_right = card_left + CARD_WIDTH
+
+        font_quiz_huge = _load_display_font(QUIZ_FONT_SIZE)
+        font_f1_badge = _load_display_font(56)
+        font_question = _load_font(46, bold=True)
+        font_option = _load_font(38)
+        font_letter = _load_font(30, bold=True)
+        quiz_half_h = _quiz_half_height(font_quiz_huge)
+
+        # Measure content height, then center white card on canvas
+        probe_card_top = 120
+        header = _layout_header(card_left, card_right, probe_card_top, font_quiz_huge, font_f1_badge)
+        inner_pad = 40
+        inner_left = card_left + inner_pad
+        inner_right = card_right - inner_pad
+        inner_width = inner_right - inner_left
+
+        y = max(header["header_bottom"] + 28, probe_card_top + quiz_half_h)
+        question_lines = _wrap_text(content.question, font_question, inner_width)
+        q_line_h = _line_height(font_question)
+        for _ in question_lines:
+            y += q_line_h + 10
+        y += 32
+        for letter in ("A", "B", "C", "D"):
+            y += _measure_option_row_height(content.options[letter], font_option, inner_width)
+
+        card_height = y + card_bottom_pad - probe_card_top
+        visual_height = card_height + quiz_half_h
+        card_top = (CANVAS_HEIGHT - visual_height) // 2 + quiz_half_h
+        card_bottom = card_top + card_height
+
+        header = _layout_header(card_left, card_right, card_top, font_quiz_huge, font_f1_badge)
+        quiz_text = header["quiz_text"]
+        f1_text = header["f1_text"]
+        quiz_x = header["quiz_x"]
+        quiz_y = header["quiz_y"]
+        quiz_bbox = header["quiz_bbox"]
+        f1_x = header["f1_x"]
+        f1_y = header["f1_y"]
+        f1_w = header["f1_w"]
+        f1_h = header["f1_h"]
+        header_bottom = header["header_bottom"]
+
+        canvas = _create_background(CANVAS_WIDTH, CANVAS_HEIGHT)
 
         # Drop shadow
         shadow = Image.new("RGBA", (CANVAS_WIDTH, CANVAS_HEIGHT), (0, 0, 0, 0))
@@ -800,7 +975,7 @@ def create_post_image(content: QuizContent) -> Path:
         canvas = canvas.convert("RGB")
         draw = ImageDraw.Draw(canvas)
 
-        # White card
+        # White card — height fits content (no extra whitespace below options)
         _rounded_rect(
             draw,
             (card_left, card_top, card_right, card_bottom),
@@ -808,58 +983,35 @@ def create_post_image(content: QuizContent) -> Path:
             fill=COLOR_WHITE,
         )
 
-        font_badge_title = _load_font(52, bold=True)
-        font_badge_quiz = _load_font(28, bold=True)
-        font_question = _load_font(38, bold=True)
-        font_option = _load_font(26)
-        font_letter = _load_font(24, bold=True)
-
-        # Header badge overlapping card top
-        badge_y = card_top - 28
-        title_text = "F1 PADDOCK"
-        quiz_text = "QUIZ"
-        title_w = _text_width(title_text, font_badge_title) + 48
-        quiz_w = _text_width(quiz_text, font_badge_quiz) + 40
-        badge_x = (CANVAS_WIDTH - title_w - quiz_w - 16) // 2
+        draw.text(
+            (quiz_x, quiz_y),
+            quiz_text,
+            font=font_quiz_huge,
+            fill=COLOR_BLACK,
+            stroke_width=QUIZ_STROKE_WIDTH,
+            stroke_fill=COLOR_WHITE,
+        )
 
         _rounded_rect(
             draw,
-            (badge_x, badge_y, badge_x + title_w, badge_y + 64),
-            radius=32,
+            (f1_x, f1_y, f1_x + f1_w, f1_y + f1_h),
+            radius=f1_h // 2,
             fill=COLOR_WHITE,
             outline=COLOR_BLACK,
             width=3,
         )
-        draw.text((badge_x + 24, badge_y + 10), title_text, font=font_badge_title, fill=COLOR_BLACK)
+        f1_bbox = draw.textbbox((0, 0), f1_text, font=font_f1_badge)
+        f1_tx = f1_x + (f1_w - (f1_bbox[2] - f1_bbox[0])) // 2
+        f1_ty = f1_y + (f1_h - (f1_bbox[3] - f1_bbox[1])) // 2 - f1_bbox[1]
+        draw.text((f1_tx, f1_ty), f1_text, font=font_f1_badge, fill=COLOR_BLACK)
 
-        quiz_x = badge_x + title_w + 8
-        _rounded_rect(
-            draw,
-            (quiz_x, badge_y + 8, quiz_x + quiz_w, badge_y + 56),
-            radius=24,
-            fill=COLOR_BLACK,
-        )
-        draw.text((quiz_x + 20, badge_y + 16), quiz_text, font=font_badge_quiz, fill=COLOR_WHITE)
+        y = max(header_bottom + 28, card_top + quiz_half_h)
 
-        # Dashed arrow from badge toward question
-        arrow_start = (badge_x + title_w // 2, badge_y + 64)
-        arrow_end = (card_left + 80, card_top + 100)
-        _draw_dashed_curve(draw, arrow_start, arrow_end)
-
-        inner_left = card_left + 48
-        inner_right = card_right - 48
-        inner_width = inner_right - inner_left
-        y = card_top + 88
-
-        # Question text
-        question_lines = _wrap_text(content.question, font_question, inner_width)
-        q_line_h = _line_height(font_question)
         for line in question_lines:
             draw.text((inner_left, y), line, font=font_question, fill=COLOR_GRAY_TEXT)
-            y += q_line_h + 8
-        y += 36
+            y += q_line_h + 10
+        y += 32
 
-        # Options A–D
         for letter in ("A", "B", "C", "D"):
             y = _draw_option_row(
                 draw,
@@ -1129,8 +1281,7 @@ def _graph_request(method: str, endpoint: str, **kwargs: Any) -> dict[str, Any]:
 
     if not response.ok or "error" in data:
         error = data.get("error", {})
-        message = error.get("message", response.text)
-        raise RuntimeError(f"{api_label} error: {message}")
+        raise RuntimeError(_format_graph_api_error(error, api_label))
     return data
 
 
@@ -1240,7 +1391,41 @@ def wait_and_post_comment(record_id: int, media_id: str, comment_text: str, sche
 # ---------------------------------------------------------------------------
 
 
-def run_pipeline() -> None:
+def test_instagram_token() -> None:
+    """Print Instagram token diagnostics without publishing."""
+    if not INSTAGRAM_ACCESS_TOKEN:
+        raise EnvironmentError("INSTAGRAM_ACCESS_TOKEN is required")
+
+    token = INSTAGRAM_ACCESS_TOKEN
+    print(f"Token prefix: {token[:8]}...")
+    print(f"Token length: {len(token)}")
+    print(f"API mode: {'Instagram Login' if _uses_instagram_login_api() else 'Facebook Graph'}")
+    if INSTAGRAM_ACCOUNT_ID:
+        print(f"INSTAGRAM_ACCOUNT_ID (env): {INSTAGRAM_ACCOUNT_ID}")
+
+    base = _instagram_api_base()
+    print(f"API host: {base}")
+
+    try:
+        data = _graph_request("GET", "me", params={"fields": "id,user_id,username,account_type"})
+        print(f"[OK] /me — @{data.get('username', 'unknown')}")
+        print(f"     publish id: {data.get('user_id') or data.get('id')}")
+    except RuntimeError as exc:
+        print(f"[FAIL] /me — {exc}")
+
+    if INSTAGRAM_ACCOUNT_ID and INSTAGRAM_ACCOUNT_ID.isdigit():
+        try:
+            data = _graph_request(
+                "GET",
+                INSTAGRAM_ACCOUNT_ID,
+                params={"fields": "id,username,name"},
+            )
+            print(f"[OK] account — @{data.get('username', 'unknown')}")
+        except RuntimeError as exc:
+            print(f"[FAIL] account lookup — {exc}")
+
+
+def run_pipeline(image_only: bool = False) -> None:
     logger.info("=" * 60)
     logger.info("F1 Paddock Quiz — Instagram Automation Pipeline")
     logger.info("=" * 60)
@@ -1254,6 +1439,15 @@ def run_pipeline() -> None:
         logger.info("Posted %s overdue answer comment(s)", overdue)
 
     content = generate_content()
+    if image_only:
+        image_path = create_post_image(content)
+        logger.info("=" * 60)
+        logger.info("Image-only mode — Instagram publish skipped")
+        logger.info("  Question: %s", content.question)
+        logger.info("  Image   : %s", image_path.resolve())
+        logger.info("=" * 60)
+        return
+
     record_id = record_question(content)
 
     image_path = create_post_image(content)
@@ -1351,6 +1545,25 @@ def main() -> int:
             return 0
         except (EnvironmentError, RuntimeError) as exc:
             logger.error("%s", exc)
+            return 1
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--test-token":
+        load_dotenv()
+        try:
+            test_instagram_token()
+            return 0
+        except (EnvironmentError, RuntimeError) as exc:
+            logger.error("%s", exc)
+            return 1
+
+    if len(sys.argv) > 1 and sys.argv[1] == "--image-only":
+        load_dotenv()
+        try:
+            validate_env()
+            run_pipeline(image_only=True)
+            return 0
+        except (EnvironmentError, RuntimeError) as exc:
+            logger.error("Pipeline failed: %s", exc)
             return 1
 
     try:
