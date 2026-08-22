@@ -1,11 +1,9 @@
-name: F1 Paddock Quiz — Daily Post
+name: F1 Paddock Quiz — Answer Comments
 
 on:
   schedule:
-    # Post 1 — UTC 09:00 (Turkey 12:00)
-    - cron: '0 9 * * *'
-    # Post 2 — UTC 17:00 (Turkey 20:00)
-    - cron: '0 17 * * *'
+    # Every hour at :05 UTC — offset from post crons (:00) to avoid schedule collisions
+    - cron: '5 * * * *'
 
   workflow_dispatch:
 
@@ -13,11 +11,11 @@ permissions:
   contents: write
 
 concurrency:
-  group: f1paddockquiz-post-${{ github.ref_name }}
+  group: f1paddockquiz-comments-${{ github.ref_name }}
   cancel-in-progress: false
 
 jobs:
-  run-post:
+  run-comments:
     runs-on: ubuntu-latest
 
     steps:
@@ -41,14 +39,8 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Install system fonts (fallback)
-        run: sudo apt-get update && sudo apt-get install -y --no-install-recommends fonts-dejavu-core
-
-      - name: Run Quiz Post Automation
+      - name: Post Scheduled Answer Comments
         env:
-          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
-          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
           INSTAGRAM_ACCESS_TOKEN: ${{ secrets.INSTAGRAM_ACCESS_TOKEN }}
-          IMGUR_CLIENT_ID: ${{ secrets.IMGUR_CLIENT_ID }}
-          COMMENT_DELAY_HOURS: 3
-        run: python main.py
+          INSTAGRAM_ACCOUNT_ID: ${{ secrets.INSTAGRAM_ACCOUNT_ID }}
+        run: python main.py --post-comments
