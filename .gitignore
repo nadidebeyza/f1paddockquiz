@@ -4,5 +4,4 @@ __pycache__/
 .venv/
 venv/
 final_post.jpg
-database.db
 *.log

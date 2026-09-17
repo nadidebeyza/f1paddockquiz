@@ -51,6 +51,9 @@ GEMINI_FALLBACK_MODELS = [
 INSTAGRAM_ACCOUNT_ID = (os.getenv("INSTAGRAM_ACCOUNT_ID") or "").strip()
 INSTAGRAM_ACCESS_TOKEN = (os.getenv("INSTAGRAM_ACCESS_TOKEN") or "").strip().strip('"').strip("'")
 FACEBOOK_PAGE_ID = os.getenv("FACEBOOK_PAGE_ID", "")
+BRAND_NAME = os.getenv("BRAND_NAME", "f1paddockquiz")
+WATERMARK_TEXT = os.getenv("WATERMARK_TEXT", f"@{BRAND_NAME}")
+BRAND_HANDLE = f"@{BRAND_NAME}"
 IMGUR_CLIENT_ID = (os.getenv("IMGUR_CLIENT_ID") or "").strip()
 GITHUB_HOST_PATH = os.getenv("GITHUB_HOST_PATH", "public/latest_post.jpg")
 
@@ -79,6 +82,7 @@ COLOR_SHADOW = (0, 0, 0, 60)
 BASE_DIR = Path(__file__).resolve().parent
 OUTPUT_IMAGE = BASE_DIR / "final_post.jpg"
 DATABASE_PATH = BASE_DIR / "database.db"
+PENDING_COMMENTS_FILE = BASE_DIR / "pending_comments.json"
 FONT_PATH = BASE_DIR / "font.ttf"
 FONT_SANS_PATH = BASE_DIR / "fonts" / "Inter.ttf"
 FONT_DISPLAY_PATHS = (
@@ -136,7 +140,7 @@ CONTENT_JSON_SCHEMA: dict[str, Any] = {
     "required": ["question", "options", "correct_option", "explanation", "caption"],
 }
 
-GEMINI_SYSTEM_PROMPT = """You are the content engine for @f1paddockquiz — an Instagram account that posts
+GEMINI_SYSTEM_PROMPT = f"""You are the content engine for {BRAND_HANDLE} — an Instagram account that posts
 REALLY HARD / HARDCORE Formula 1 trivia for true racing fans and F1 gurus.
 
 Generate ONE unique quiz question that is:
@@ -175,7 +179,7 @@ logging.basicConfig(
     format="%(asctime)s | %(levelname)s | %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
-logger = logging.getLogger("f1paddockquiz")
+logger = logging.getLogger(BRAND_NAME)
 
 
 def _strip_markdown(text: str) -> str:
@@ -436,6 +440,64 @@ def show_question_history() -> None:
 
 
 # ---------------------------------------------------------------------------
+# JSON-based Pending Comments (for reliable cross-workflow state)
+# ---------------------------------------------------------------------------
+
+
+def load_pending_comments_json() -> list[dict[str, Any]]:
+    """Load pending comments from JSON file (git-committed for cross-workflow reliability)."""
+    if not PENDING_COMMENTS_FILE.exists():
+        return []
+    try:
+        with open(PENDING_COMMENTS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+            return data.get("pending", [])
+    except (json.JSONDecodeError, OSError) as exc:
+        logger.warning("Could not load pending comments JSON: %s", exc)
+        return []
+
+
+def save_pending_comments_json(pending: list[dict[str, Any]]) -> None:
+    """Save pending comments to JSON file."""
+    with open(PENDING_COMMENTS_FILE, "w", encoding="utf-8") as f:
+        json.dump({"pending": pending}, f, indent=2, ensure_ascii=False)
+    logger.info("Saved %d pending comment(s) to %s", len(pending), PENDING_COMMENTS_FILE.name)
+
+
+def add_pending_comment_json(
+    media_id: str,
+    comment_text: str,
+    scheduled_at: str,
+    question_text: str,
+) -> None:
+    """Add a new pending comment to the JSON file."""
+    pending = load_pending_comments_json()
+    pending.append({
+        "media_id": media_id,
+        "comment_text": comment_text,
+        "scheduled_at": scheduled_at,
+        "question_text": question_text,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    })
+    save_pending_comments_json(pending)
+
+
+def get_due_pending_comments_json() -> list[dict[str, Any]]:
+    """Return pending comments whose scheduled time has passed."""
+    pending = load_pending_comments_json()
+    now = datetime.now(timezone.utc).isoformat()
+    return [p for p in pending if p.get("scheduled_at", "") <= now]
+
+
+def remove_pending_comment_json(media_id: str) -> None:
+    """Remove a pending comment after it has been posted."""
+    pending = load_pending_comments_json()
+    updated = [p for p in pending if p.get("media_id") != media_id]
+    save_pending_comments_json(updated)
+    logger.info("Removed pending comment for media_id %s", media_id)
+
+
+# ---------------------------------------------------------------------------
 # Stage 1 — Content Engine (Gemini)
 # ---------------------------------------------------------------------------
 
@@ -463,7 +525,7 @@ def _format_graph_api_error(error: dict[str, Any], api_label: str) -> str:
             "  2. Meta Developer Console → your app → generate a new Instagram access token\n"
             "  3. Required scopes: instagram_business_basic, instagram_business_content_publish\n"
             "  4. App must be Live with Advanced Access (Development mode only works for testers)\n"
-            "  5. Meta Business Suite → Instagram accounts → reconnect @f1paddockquiz to the app"
+            f"  5. Meta Business Suite → Instagram accounts → reconnect {BRAND_HANDLE} to the app"
         )
     return f"{api_label} error: {message}"
 
@@ -1514,10 +1576,12 @@ def run_pipeline(image_only: bool = False) -> None:
     validate_env()
     init_db()
 
-    # Post any overdue comments from previous runs first
-    overdue = process_pending_comments()
-    if overdue:
-        logger.info("Posted %s overdue answer comment(s)", overdue)
+    # Post any overdue comments from previous runs first (JSON is primary)
+    json_overdue = process_pending_comments_json()
+    sqlite_overdue = process_pending_comments()
+    total_overdue = json_overdue + sqlite_overdue
+    if total_overdue:
+        logger.info("Posted %s overdue answer comment(s)", total_overdue)
 
     content = generate_content()
     if image_only:
@@ -1544,6 +1608,13 @@ def run_pipeline(image_only: bool = False) -> None:
     comment_text = content.answer_comment()
     mark_published(record_id, media_id, scheduled_at.isoformat(), comment_text)
 
+    add_pending_comment_json(
+        media_id=media_id,
+        comment_text=comment_text,
+        scheduled_at=scheduled_at.isoformat(),
+        question_text=content.question,
+    )
+
     logger.info(
         "Answer comment scheduled for %s (%d hours after publish)",
         scheduled_at.isoformat(),
@@ -1552,6 +1623,7 @@ def run_pipeline(image_only: bool = False) -> None:
 
     if WAIT_FOR_COMMENT:
         wait_and_post_comment(record_id, media_id, comment_text, scheduled_at)
+        remove_pending_comment_json(media_id)
     else:
         logger.info(
             "Run `python main.py --post-comments` after %s to publish the answer, "
@@ -1569,12 +1641,51 @@ def run_pipeline(image_only: bool = False) -> None:
     logger.info("=" * 60)
 
 
+def process_pending_comments_json() -> int:
+    """Post all due answer comments from JSON storage (primary method)."""
+    due = get_due_pending_comments_json()
+    if not due:
+        logger.info("No pending comments due in JSON storage")
+        return 0
+
+    posted = 0
+    for item in due:
+        media_id = item.get("media_id")
+        comment_text = item.get("comment_text")
+        if not media_id or not comment_text:
+            logger.warning("Invalid pending comment entry: %s", item)
+            continue
+
+        try:
+            post_comment(media_id, comment_text)
+            remove_pending_comment_json(media_id)
+            posted += 1
+            logger.info(
+                "Answer comment posted for media_id %s (question: %s...)",
+                media_id,
+                item.get("question_text", "")[:50],
+            )
+        except RuntimeError as exc:
+            logger.error("Failed to post comment for media_id %s: %s", media_id, exc)
+    return posted
+
+
 def run_comment_job() -> None:
-    """Standalone job: post all due answer comments."""
+    """Standalone job: post all due answer comments from both JSON and SQLite storage."""
     validate_instagram_env()
     init_db()
-    count = process_pending_comments()
-    logger.info("Comment job finished — %s comment(s) posted", count)
+
+    json_count = process_pending_comments_json()
+
+    sqlite_count = process_pending_comments()
+
+    total = json_count + sqlite_count
+    logger.info(
+        "Comment job finished — %s comment(s) posted (JSON: %s, SQLite: %s)",
+        total,
+        json_count,
+        sqlite_count,
+    )
 
 
 def lookup_instagram_account_id() -> None:
