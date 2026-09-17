@@ -63,6 +63,7 @@ jobs:
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
+          git pull --rebase || true
           git add pending_comments.json database.db || true
           git diff --staged --quiet || git commit -m "ci: update pending comments after post"
-          git push
+          git push || (git pull --rebase && git push)
