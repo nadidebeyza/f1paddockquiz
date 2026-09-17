@@ -40,8 +40,10 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.6-flash")
 GEMINI_MAX_RETRIES = int(os.getenv("GEMINI_MAX_RETRIES", "4"))
 GEMINI_RETRY_BASE_SECONDS = int(os.getenv("GEMINI_RETRY_BASE_SECONDS", "5"))
 MODELS_TO_TRY = [
-    "gemini-3.6-flash",
-    "gemini-3.5-flash",
+    "gemini-2.0-flash",
+    "gemini-2.5-flash",
+    "gemini-1.5-flash",
+    "gemini-1.5-pro",
 ]
 GEMINI_FALLBACK_MODELS = [
     model.strip()
@@ -644,6 +646,12 @@ def build_gemini_prompt(recent_questions: list[str], *, duplicate_retry: bool = 
     return prompt
 
 
+def _is_retryable_error(exc: Exception) -> bool:
+    """Check if error is retryable (503, 429, rate limit, etc.)."""
+    message = str(exc).lower()
+    return any(term in message for term in ["503", "429", "unavailable", "rate limit", "overloaded", "high demand"])
+
+
 def _call_gemini_for_content(client: genai.Client, prompt: str) -> QuizContent:
     config = types.GenerateContentConfig(
         temperature=0.9,
@@ -653,32 +661,50 @@ def _call_gemini_for_content(client: genai.Client, prompt: str) -> QuizContent:
     last_error: Exception | None = None
 
     for model in _gemini_models_to_try():
-        try:
-            logger.info("Attempting content generation with model: %s", model)
-            response = client.models.generate_content(
-                model=model,
-                contents=prompt,
-                config=config,
-            )
-            raw = response.text
-            if not raw:
-                raise ValueError("Gemini returned an empty response")
-            data = json.loads(raw)
-            return QuizContent.from_dict(data)
-        except json.JSONDecodeError as exc:
-            logger.warning("Model %s returned invalid JSON (%s). Trying next...", model, exc)
-            last_error = exc
-        except ValueError as exc:
-            logger.warning("Model %s validation failed (%s). Trying next...", model, exc)
-            last_error = exc
-        except genai.errors.ClientError as exc:
-            if _is_invalid_gemini_api_key_error(exc):
-                raise RuntimeError("Invalid GEMINI_API_KEY.") from exc
-            logger.warning("Model %s failed (%s). Trying next...", model, exc)
-            last_error = exc
-        except Exception as exc:
-            logger.warning("Model %s failed (%s). Trying next...", model, exc)
-            last_error = exc
+        for retry in range(GEMINI_MAX_RETRIES):
+            try:
+                if retry > 0:
+                    wait_time = GEMINI_RETRY_BASE_SECONDS * (2 ** (retry - 1))
+                    logger.info("Retry %d/%d for %s — waiting %ds...", retry, GEMINI_MAX_RETRIES - 1, model, wait_time)
+                    time.sleep(wait_time)
+
+                logger.info("Attempting content generation with model: %s", model)
+                response = client.models.generate_content(
+                    model=model,
+                    contents=prompt,
+                    config=config,
+                )
+                raw = response.text
+                if not raw:
+                    raise ValueError("Gemini returned an empty response")
+                data = json.loads(raw)
+                return QuizContent.from_dict(data)
+            except json.JSONDecodeError as exc:
+                logger.warning("Model %s returned invalid JSON (%s). Trying next model...", model, exc)
+                last_error = exc
+                break
+            except ValueError as exc:
+                logger.warning("Model %s validation failed (%s). Trying next model...", model, exc)
+                last_error = exc
+                break
+            except genai.errors.ClientError as exc:
+                if _is_invalid_gemini_api_key_error(exc):
+                    raise RuntimeError("Invalid GEMINI_API_KEY.") from exc
+                if _is_retryable_error(exc) and retry < GEMINI_MAX_RETRIES - 1:
+                    logger.warning("Model %s got retryable error (%s). Will retry...", model, exc)
+                    last_error = exc
+                    continue
+                logger.warning("Model %s failed (%s). Trying next model...", model, exc)
+                last_error = exc
+                break
+            except Exception as exc:
+                if _is_retryable_error(exc) and retry < GEMINI_MAX_RETRIES - 1:
+                    logger.warning("Model %s got retryable error (%s). Will retry...", model, exc)
+                    last_error = exc
+                    continue
+                logger.warning("Model %s failed (%s). Trying next model...", model, exc)
+                last_error = exc
+                break
 
     raise RuntimeError("All Gemini models failed.") from last_error
 
