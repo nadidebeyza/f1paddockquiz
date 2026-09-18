@@ -1602,12 +1602,10 @@ def run_pipeline(image_only: bool = False) -> None:
     validate_env()
     init_db()
 
-    # Post any overdue comments from previous runs first (JSON is primary)
-    json_overdue = process_pending_comments_json()
-    sqlite_overdue = process_pending_comments()
-    total_overdue = json_overdue + sqlite_overdue
-    if total_overdue:
-        logger.info("Posted %s overdue answer comment(s)", total_overdue)
+    # Post any overdue comments from previous runs first (JSON only)
+    overdue = process_pending_comments_json()
+    if overdue:
+        logger.info("Posted %s overdue answer comment(s)", overdue)
 
     content = generate_content()
     if image_only:
@@ -1697,21 +1695,11 @@ def process_pending_comments_json() -> int:
 
 
 def run_comment_job() -> None:
-    """Standalone job: post all due answer comments from both JSON and SQLite storage."""
+    """Standalone job: post all due answer comments from JSON storage."""
     validate_instagram_env()
-    init_db()
 
-    json_count = process_pending_comments_json()
-
-    sqlite_count = process_pending_comments()
-
-    total = json_count + sqlite_count
-    logger.info(
-        "Comment job finished — %s comment(s) posted (JSON: %s, SQLite: %s)",
-        total,
-        json_count,
-        sqlite_count,
-    )
+    count = process_pending_comments_json()
+    logger.info("Comment job finished — %s comment(s) posted", count)
 
 
 def lookup_instagram_account_id() -> None:
