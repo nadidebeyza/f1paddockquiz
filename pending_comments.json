@@ -1,3 +1,11 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "media_id": "18091493066439092",
+      "comment_text": "✅ Correct Answer: B — 1992 Hungarian Grand Prix\n\n📖 Explanation:\n\nThe 1992 Hungarian Grand Prix marked the final time a pre-qualifying session was held in Formula 1. This system was used to weed out slower entrants when more than 30 cars were entered for a race weekend.\n\nFollowing the Hungarian round, the Brabham team collapsed and withdrew from the championship, which automatically reduced the entry list to 30 cars.\n\nThis withdrawal eliminated the need for pre-qualifying starting from the next race in Belgium, and the rule was permanently discarded ahead of the 1993 season.",
+      "scheduled_at": "2026-09-19T22:09:14.258653+00:00",
+      "question_text": "Which Grand Prix was the last in Formula 1 history to feature a pre-qualifying session before the practice was officially abandoned?",
+      "created_at": "2026-09-19T19:09:14.260240+00:00"
+    }
+  ]
 }
