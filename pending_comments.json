@@ -1,3 +1,11 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "media_id": "18075013550444699",
+      "comment_text": "✅ Correct Answer: B — Heinz-Harald Frentzen\n\n📖 Explanation:\n\nAt the 1996 Monaco Grand Prix, Olivier Panis took a shock victory in a race where only three cars saw the checkered flag.\n\nHeinz-Harald Frentzen, driving for Sauber, was running in fourth place when he damaged his front wing against teammate Johnny Herbert's car.\n\nFrentzen drove into the pit lane to retire on lap 74 of 75, but because he had completed the majority of the race distance, he was officially classified fourth.",
+      "scheduled_at": "2026-09-24T16:55:36.743721+00:00",
+      "question_text": "Only three cars crossed the finish line at the chaotic, rain-affected 1996 Monaco Grand Prix. Which driver was classified fourth, despite retiring in the pit lane on the penultimate lap?",
+      "created_at": "2026-09-24T13:55:36.745502+00:00"
+    }
+  ]
 }
