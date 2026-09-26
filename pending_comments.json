@@ -1,3 +1,11 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "media_id": "18082524236328761",
+      "comment_text": "✅ Correct Answer: A — Niki Lauda\n\n📖 Explanation:\n\nNiki Lauda finished second on track behind his McLaren teammate John Watson at Zolder, but was disqualified during post-race scrutineering when his car weighed 578 kg — 2 kg under the required limit.\n\nThe post-race decision promoted Eddie Cheever to second place for Ligier and Ferrari's Didier Pironi to third.\n\nIt was one of several major weight controversies during the infamous 1982 FISA–FOCA war.",
+      "scheduled_at": "2026-09-26T16:26:41.559201+00:00",
+      "question_text": "At the 1982 Belgian Grand Prix at Zolder, John Watson stormed through from 10th to win. Which driver finished second on track but was post-race disqualified for an underweight car?",
+      "created_at": "2026-09-26T13:26:41.561579+00:00"
+    }
+  ]
 }
