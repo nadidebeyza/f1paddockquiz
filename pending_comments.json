@@ -1,3 +1,11 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "media_id": "18355183021216198",
+      "comment_text": "✅ Correct Answer: B — Sidepod bargeboards non-compliant by 10 millimetres\n\n📖 Explanation:\n\nFollowing the 1999 Malaysian Grand Prix, scrutineers disqualified race winner Eddie Irvine and second-place Michael Schumacher when their bargeboards failed dimensional checks by 10 millimetres.\n\nFerrari successfully appealed the decision in Paris, proving the FIA measurement process contained ambiguities, leading to full reinstatement of their 1-2 finish.",
+      "scheduled_at": "2026-10-03T17:02:03.562977+00:00",
+      "question_text": "At the inaugural 1999 Malaysian Grand Prix, Ferrari scored a 1-2 finish before both cars were initially disqualified post-race. What technical non-compliance caused their initial disqualification?",
+      "created_at": "2026-10-03T14:02:03.564973+00:00"
+    }
+  ]
 }
