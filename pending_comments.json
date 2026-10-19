@@ -1,3 +1,11 @@
 {
-  "pending": []
+  "pending": [
+    {
+      "media_id": "18194468776395124",
+      "comment_text": "✅ Correct Answer: B — Michael Schumacher\n\n📖 Explanation:\n\nDuring qualifying at Jerez in 1997, Jacques Villeneuve set the initial benchmark of 1:21.072 just 14 minutes into the session.\n\nExactly 14 minutes later, Michael Schumacher matched Villeneuve's lap time down to the thousandth of a second, placing him second on the grid as rules prioritized whoever set the time first.\n\nHeinz-Harald Frentzen later matched the identical 1:21.072 with 9 minutes remaining, completing the only three-way tie for pole position in Formula 1 history.",
+      "scheduled_at": "2026-10-20T00:19:58.830490+00:00",
+      "question_text": "At the 1997 European Grand Prix qualifying session at Jerez, three drivers set an identical lap time of 1:21.072. Which driver recorded the time SECOND to secure P2 on the grid?",
+      "created_at": "2026-10-19T21:19:58.832723+00:00"
+    }
+  ]
 }
